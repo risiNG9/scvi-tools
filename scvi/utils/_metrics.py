@@ -8,13 +8,13 @@ from sklearn.neighbors import NearestNeighbors
 class metrics:
     def __init__(self, adata):
         self.adata = adata
-
+    
     def silhouette_labels(
-        self,
-        labels_key: str = "labels_bench",
-        metric: str = "euclidean",
-        embedding: str = "X_scvi",
-        scale: bool = True,
+    self,
+    labels_key: str = "labels_bench",
+    metric: str = "euclidean",
+    embedding: str = "X_scvi",
+    scale: bool = True,
     ) -> float:
         """
         Wrapper of Silhoutte score from sklearn, with respect to observed cell type labels.
@@ -171,3 +171,4 @@ class metrics:
             nmis.append(nmi)
 
         return np.max(nmis)
+        
