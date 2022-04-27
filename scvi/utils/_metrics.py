@@ -1,8 +1,8 @@
 import numpy as np
 import pandas as pd
-import scipy
+import scvi
 from anndata import AnnData
-from sklearn.neighbors import NearestNeighbors
+import random
 
 
 class metrics:
@@ -171,4 +171,76 @@ class metrics:
             nmis.append(nmi)
 
         return np.max(nmis)
+    
+    def ranking(self, model, donors, donor_key, label_key):
+        """
+        Helper function for get_batchy_genes. Computes the s2b gene rankings for one trial of k donors.
+        Parameters
+        ----------
+        model
+            Model used to train adata.
+        donors
+            List of donors in subset.
+        donor_key
+            Key in `adata.obs` containing donor labels
+        label_key
+            Key in `adata.obs` containing cell type labels
+        """
+        subset = self.adata[self.adata.obs[donor_key].isin(donors)]
+        subset = subset.copy()
+        scvi.model.SCVI.setup_anndata(
+            subset,batch_key=donor_key,labels_key=label_key
+        )
+        genes = self.adata.var.index
+
+        df = pd.DataFrame(columns = range(len(donors)))
+        for i,donor in enumerate(donors):
+            df[i] = model.get_normalized_expression(subset,transform_batch=donor).median()
         
+        s2b = df.std(axis=1).divide(df.mean(axis=1))
+        s2b = s2b.sort_values(ascending=False)
+        s2b_ranks = pd.DataFrame({'s2b':s2b,'rank':range(len(genes))})
+
+        ranks = []
+        for gene in genes:
+            ranks += [s2b_ranks.loc[gene]['rank']]
+        return ranks
+
+    def get_batchy_genes(
+        self, 
+        model, 
+        donor_key: str = 'patient_id', 
+        label_key: str = 'initial_clustering',
+        n_donors_per_trial: int = 10, 
+        n_trials: int = 10):
+        """
+        Returns dataframe of genes ranked by sensitivity to batch, along with their mean rank and std.
+        Parameters
+        ----------
+        model
+            Model used to train adata.
+        biological_metadata
+            etc
+        donor_key
+            Key in `adata.obs` containing donor labels
+        label_key
+            Key in `adata.obs` containing cell type labels
+        n_donors_per_trial
+            Number of donors in one trial.
+        n_trials
+            Number of trials.
+        """
+        donors = self.adata.obs[donor_key].unique().tolist()
+        genes = self.adata.var.index
+        consensus_ranks = np.empty((len(genes),n_donors_per_trial))
+        for i in range(n_trials):
+            sample = random.sample(donors,n_donors_per_trial)
+            ranks = self.ranking(model,sample,donor_key,label_key)
+            consensus_ranks[:,i] = ranks
+        
+        mean_std = []
+        for g in range(len(genes)):
+            mean_std += [[consensus_ranks[g,:].mean(),consensus_ranks[g,:].std()]]
+        mean_std = np.array(mean_std)
+        df = pd.DataFrame(data={'gene':genes.to_list(),'mean_rank':mean_std[:,0],'mean_std':mean_std[:,1]})
+        return df.sort_values('mean_rank')
