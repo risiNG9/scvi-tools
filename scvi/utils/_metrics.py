@@ -230,6 +230,10 @@ class metrics:
         n_trials
             Number of trials.
         """
+        import logging
+        logger = logging.getLogger()
+        logger.setLevel(logging.CRITICAL)
+        
         donors = self.adata.obs[donor_key].unique().tolist()
         genes = self.adata.var.index
         consensus_ranks = np.empty((len(genes),n_donors_per_trial))
