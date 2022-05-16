@@ -4,6 +4,7 @@ import numpy as np
 
 from scvi.dataloaders import DataSplitter
 from scvi.train import TrainingPlan, TrainRunner
+from scvi.train._callbacks import IntelExtensionCallback
 
 
 class UnsupervisedTrainingMixin:
@@ -18,6 +19,7 @@ class UnsupervisedTrainingMixin:
         batch_size: int = 128,
         early_stopping: bool = False,
         plan_kwargs: Optional[dict] = None,
+        use_intel_extension: bool = False,
         **trainer_kwargs,
     ):
         """
@@ -66,6 +68,12 @@ class UnsupervisedTrainingMixin:
         trainer_kwargs[es] = (
             early_stopping if es not in trainer_kwargs.keys() else trainer_kwargs[es]
         )
+        callbacks_key = "callbacks"
+        if callbacks_key not in trainer_kwargs.keys():
+            trainer_kwargs[callbacks_key] = []
+        if use_intel_extension:
+            trainer_kwargs[callbacks_key].append(IntelExtensionCallback())
+
         runner = TrainRunner(
             self,
             training_plan=training_plan,

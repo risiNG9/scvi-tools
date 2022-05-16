@@ -2,6 +2,7 @@ import warnings
 from copy import deepcopy
 from typing import Optional, Tuple
 
+import intel_extension_for_pytorch as ipex
 import numpy as np
 import pytorch_lightning as pl
 import torch
@@ -142,3 +143,20 @@ class LoudEarlyStopping(EarlyStopping):
     ) -> None:
         if self.early_stopping_reason is not None:
             print(self.early_stopping_reason)
+
+
+class IntelExtensionCallback(Callback):
+    def on_train_start(self, trainer, pl_module):
+        ipex_kwargs = {}
+        optimizers = trainer.optimizers
+        opt_optimizer = len(optimizers) == 1
+        if opt_optimizer:
+            ipex_kwargs.update({"optimizer": optimizers[0]})
+
+        opt_return = ipex.optimize(
+            pl_module.module, **ipex_kwargs)
+        if opt_optimizer:
+            pl_module.module = opt_return[0]
+            trainer.optimizers = [opt_return[1]]
+        else:
+            pl_module.module = opt_return
