@@ -147,15 +147,17 @@ class LoudEarlyStopping(EarlyStopping):
 
 class IntelExtensionCallback(Callback):
     def on_train_start(self, trainer, pl_module):
-        ipex_kwargs = {}
+        ipex_kwargs = dict(dtype=torch.float32)
         optimizers = trainer.optimizers
         opt_optimizer = len(optimizers) == 1
         if opt_optimizer:
             ipex_kwargs.update({"optimizer": optimizers[0]})
 
+        print("Using Intel Extension for PyTorch to optimize model.")
         opt_return = ipex.optimize(
             pl_module.module, **ipex_kwargs)
         if opt_optimizer:
+            print(pl_module.module == opt_return[0])
             pl_module.module = opt_return[0]
             trainer.optimizers = [opt_return[1]]
         else:
