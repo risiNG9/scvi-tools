@@ -9,7 +9,7 @@ from anndata import AnnData
 
 from scvi import REGISTRY_KEYS
 from scvi.data import AnnDataManager
-from scvi.data.fields import LayerField, NumericalObsField
+from scvi.data.fields import LayerField, NumericalObsField, ObsmField
 from scvi.model import CondSCVI
 from scvi.model.base import BaseModelClass, UnsupervisedTrainingMixin
 from scvi.module import MRDeconv
@@ -156,6 +156,7 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
     def get_proportions(
         self,
         keep_noise: bool = False,
+        normalize: bool = True,
         indices: Optional[Sequence[int]] = None,
         batch_size: Optional[int] = None,
     ) -> pd.DataFrame:
@@ -168,6 +169,8 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
         ----------
         keep_noise
             whether to account for the noise term as a standalone cell type in the proportion estimate.
+        normalize
+            Normalize outputs of proportions to have sum 1.
         indices
             Indices of cells in adata to use. Only used if amortization. If `None`, all cells are used.
         batch_size
@@ -188,7 +191,7 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
             for tensors in stdl:
                 generative_inputs = self.module._get_generative_input(tensors, None)
                 prop_local = self.module.get_proportions(
-                    x=generative_inputs["x"], keep_noise=keep_noise
+                    x=generative_inputs["x"], keep_noise=keep_noise, normalize=normalize
                 )
                 prop_ += [prop_local.cpu()]
             data = torch.cat(prop_).numpy()
@@ -199,7 +202,9 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
                 logger.info(
                     "No amortization for proportions, ignoring indices and returning results for the full data"
                 )
-            data = self.module.get_proportions(keep_noise=keep_noise)
+            data = self.module.get_proportions(
+                keep_noise=keep_noise, normalize=normalize
+            )
 
         return pd.DataFrame(
             data=data,
@@ -371,6 +376,7 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
         cls,
         adata: AnnData,
         layer: Optional[str] = None,
+        expected_proportions: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -386,6 +392,7 @@ class DestVI(UnsupervisedTrainingMixin, BaseModelClass):
         anndata_fields = [
             LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
             NumericalObsField(REGISTRY_KEYS.INDICES_KEY, "_indices"),
+            ObsmField("expected_proportions", expected_proportions),
         ]
         adata_manager = AnnDataManager(
             fields=anndata_fields, setup_method_args=setup_method_args

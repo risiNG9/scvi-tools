@@ -250,6 +250,7 @@ class MRDeconv(BaseModuleClass):
         n_obs: int = 1.0,
     ):
         x = tensors[REGISTRY_KEYS.X_KEY]
+        expected_proportion = tensors.get("expected_proportions")
         px_rate = generative_outputs["px_rate"]
         px_o = generative_outputs["px_o"]
         gamma = generative_outputs["gamma"]
@@ -265,7 +266,14 @@ class MRDeconv(BaseModuleClass):
         )
         glo_neg_log_likelihood_prior += self.beta_reg * torch.var(self.beta)
 
-        v_sparsity_loss = self.l1_reg * torch.abs(v).mean(1)
+        if expected_proportion is not None:
+            v_sparsity_loss = self.l1_reg * torch.sum(
+                torch.abs(v[:, :-1] - expected_proportion), axis=1
+            )
+        else:
+            v_sparsity_loss = self.l1_reg * torch.sum(
+                v, axis=1
+            ) + 10 * self.l1_reg * torch.square(1 - torch.sum(v, axis=1))
 
         # gamma prior likelihood
         if self.mean_vprior is None:
@@ -321,7 +329,7 @@ class MRDeconv(BaseModuleClass):
 
     @torch.no_grad()
     @auto_move_data
-    def get_proportions(self, x=None, keep_noise=False) -> np.ndarray:
+    def get_proportions(self, x=None, keep_noise=False, normalize=True) -> np.ndarray:
         """Returns the loadings."""
         if self.amortization in ["both", "proportion"]:
             # get estimated unadjusted proportions
@@ -335,7 +343,8 @@ class MRDeconv(BaseModuleClass):
         if not keep_noise:
             res = res[:, :-1]
         # normalize to obtain adjusted proportions
-        res = res / res.sum(axis=1).reshape(-1, 1)
+        if normalize:
+            res = res / res.sum(axis=1).reshape(-1, 1)
         return res
 
     @torch.no_grad()
