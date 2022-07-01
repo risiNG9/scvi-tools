@@ -61,6 +61,8 @@ class ObsmField(BaseObsmField):
         (e.g. 1, 2, 3, etc.).
     is_count_data
         If True, checks if the data are counts during validation.
+    required
+        If False, allows for `obs_key is None` and marks the field as `is_empty`.
     correct_data_format
         If True, checks and corrects that the AnnData field is C_CONTIGUOUS and csr
         if it is dense numpy or sparse respectively.
@@ -74,12 +76,18 @@ class ObsmField(BaseObsmField):
         obsm_key: str,
         colnames_uns_key: Optional[str] = None,
         is_count_data: bool = False,
+        required: bool = True,
         correct_data_format: bool = True,
     ) -> None:
         super().__init__(registry_key)
+        if required and obsm_key is None:
+            raise ValueError(
+                "`obsm_key` cannot be `None` if `required=True`. Please provide an `obs_key`."
+            )
         self._attr_key = obsm_key
         self.colnames_uns_key = colnames_uns_key
         self.is_count_data = is_count_data
+        self._is_empty = obsm_key is None
         self.correct_data_format = correct_data_format
         self.count_stat_key = f"n_{self.registry_key}"
 
@@ -89,7 +97,7 @@ class ObsmField(BaseObsmField):
 
     @property
     def is_empty(self) -> bool:
-        return False
+        return self._is_empty
 
     def validate_field(self, adata: AnnData) -> None:
         super().validate_field(adata)
