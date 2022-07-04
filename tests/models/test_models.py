@@ -1409,6 +1409,9 @@ def test_destvi(save_path):
 
     # step 2 Check model setup
     DestVI.setup_anndata(dataset, layer=None)
+    DestVI.setup_anndata(
+        dataset, layer=None, expected_proportions=np.zeros(200, n_labels)
+    )
 
     # Test clustering outside of get_vamp_prior
 
