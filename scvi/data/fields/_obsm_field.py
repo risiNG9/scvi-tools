@@ -169,7 +169,7 @@ class ObsmField(BaseObsmField):
         return {self.COLUMN_NAMES_KEY: state_registry[self.COLUMN_NAMES_KEY].copy()}
 
     def get_summary_stats(self, state_registry: dict) -> dict:
-        n_obsm_cols = len(state_registry[self.COLUMN_NAMES_KEY])
+        n_obsm_cols = len(state_registry.get(self.COLUMN_NAMES_KEY, []))
         return {self.count_stat_key: n_obsm_cols}
 
     def view_state_registry(self, state_registry: dict) -> Optional[rich.table.Table]:
