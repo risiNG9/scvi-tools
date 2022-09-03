@@ -4,7 +4,6 @@ from typing import Dict, Optional, Sequence, Union
 import numpy as np
 import torch
 from anndata import AnnData
-from torch.distributions import Normal
 
 from ._log_likelihood import compute_elbo, compute_reconstruction_error
 
@@ -152,8 +151,7 @@ class VAEMixin:
         latent_representation : np.ndarray
             Low-dimensional representation for each cell
         """
-        if self.is_trained_ is False:
-            raise RuntimeError("Please train the model first.")
+        self._check_if_trained(warn=False)
 
         adata = self._validate_anndata(adata)
         scdl = self._make_data_loader(
@@ -163,18 +161,21 @@ class VAEMixin:
         for tensors in scdl:
             inference_inputs = self.module._get_inference_input(tensors)
             outputs = self.module.inference(**inference_inputs)
-            qz_m = outputs["qz_m"]
-            qz_v = outputs["qz_v"]
+            if "qz" in outputs:
+                qz = outputs["qz"]
+            else:
+                qz_m, qz_v = outputs["qz_m"], outputs["qz_v"]
+                qz = torch.distributions.Normal(qz_m, qz_v.sqrt())
             z = outputs["z"]
 
             if give_mean:
                 # does each model need to have this latent distribution param?
                 if self.module.latent_distribution == "ln":
-                    samples = Normal(qz_m, qz_v.sqrt()).sample([mc_samples])
+                    samples = qz.sample([mc_samples])
                     z = torch.nn.functional.softmax(samples, dim=-1)
                     z = z.mean(dim=0)
                 else:
-                    z = qz_m
+                    z = qz.loc
 
             latent += [z.cpu()]
         return torch.cat(latent).numpy()

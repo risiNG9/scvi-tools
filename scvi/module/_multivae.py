@@ -7,7 +7,7 @@ from torch.nn import functional as F
 from torch.distributions import Normal, Poisson
 from torch.distributions import kl_divergence as kld
 
-from scvi import _CONSTANTS
+from scvi import REGISTRY_KEYS
 from scvi._compat import Literal
 from scvi.distributions import (
     NegativeBinomial,
@@ -194,8 +194,6 @@ class MULTIVAE(BaseModuleClass):
         Number of input proteins.
     n_batch
         Number of batches, if 0, no batch correction is performed.
-    n_labels
-        Number of labels, if 0, all cells are assumed to have the same label
     gene_likelihood
         The distribution to use for gene expression data. One of the following
         * ``'zinb'`` - Zero-Inflated Negative Binomial
@@ -236,6 +234,8 @@ class MULTIVAE(BaseModuleClass):
         covariates will only be included in the input layer.
     encode_covariates
         If True, include covariates in the input to the encoder.
+    use_size_factor_key
+        Use size_factor AnnDataField defined by the user as scaling factor in mean of conditional RNA distribution.
     """
 
     def __init__(
@@ -281,7 +281,6 @@ class MULTIVAE(BaseModuleClass):
             else n_hidden
         )
         self.n_batch = n_batch
-        self.n_labels = n_labels
 
         self.modality_weights = modality_weights
         self.modality_penalty = modality_penalty
@@ -301,6 +300,7 @@ class MULTIVAE(BaseModuleClass):
         self.use_layer_norm_decoder = use_layer_norm in ("decoder", "both")
         self.encode_covariates = encode_covariates
         self.deeply_inject_covariates = deeply_inject_covariates
+        self.use_size_factor_key = use_size_factor_key
 
         cat_list = (
             [n_batch] + list(n_cats_per_cov) if n_cats_per_cov is not None else []
@@ -331,6 +331,7 @@ class MULTIVAE(BaseModuleClass):
             var_eps=0,
             use_batch_norm=self.use_batch_norm_encoder,
             use_layer_norm=self.use_layer_norm_encoder,
+            return_dist=True,
         )
 
         # expression decoder
@@ -343,6 +344,7 @@ class MULTIVAE(BaseModuleClass):
             inject_covariates=self.deeply_inject_covariates,
             use_batch_norm=self.use_batch_norm_decoder,
             use_layer_norm=self.use_layer_norm_decoder,
+            scale_activation="softplus" if use_size_factor_key else "softmax",
         )
 
         # expression dispersion parameters
@@ -560,10 +562,10 @@ class MULTIVAE(BaseModuleClass):
             categorical_input = tuple()
 
         # Z Encoders
-        qzm_acc, qzv_acc, z_acc = self.z_encoder_accessibility(
+        qz_acc, z_acc = self.z_encoder_accessibility(
             encoder_input_accessibility, batch_index, *categorical_input
         )
-        qzm_expr, qzv_expr, z_expr = self.z_encoder_expression(
+        qz_expr, z_expr = self.z_encoder_expression(
             encoder_input_expression, batch_index, *categorical_input
         )
         qzm_pro, qzv_pro, z_pro = self.z_encoder_protein(
@@ -594,22 +596,9 @@ class MULTIVAE(BaseModuleClass):
 
         # ReFormat Outputs
         if n_samples > 1:
-            qzm_acc = qzm_acc.unsqueeze(0).expand(
-                (n_samples, qzm_acc.size(0), qzm_acc.size(1))
-            )
-            qzv_acc = qzv_acc.unsqueeze(0).expand(
-                (n_samples, qzv_acc.size(0), qzv_acc.size(1))
-            )
-            untran_za = Normal(qzm_acc, qzv_acc.sqrt()).sample()
+            untran_za = qz_acc.sample((n_samples,))
             z_acc = self.z_encoder_accessibility.z_transformation(untran_za)
-
-            qzm_expr = qzm_expr.unsqueeze(0).expand(
-                (n_samples, qzm_expr.size(0), qzm_expr.size(1))
-            )
-            qzv_expr = qzv_expr.unsqueeze(0).expand(
-                (n_samples, qzv_expr.size(0), qzv_expr.size(1))
-            )
-            untran_zr = Normal(qzm_expr, qzv_expr.sqrt()).sample()
+            untran_zr = qz_expr.sample((n_samples,))
             z_expr = self.z_encoder_expression.z_transformation(untran_zr)
 
             qzm_pro = qzm_pro.unsqueeze(0).expand(
@@ -773,13 +762,19 @@ class MULTIVAE(BaseModuleClass):
         z = inference_outputs["z"]
         qz_m = inference_outputs["qz_m"]
         libsize_expr = inference_outputs["libsize_expr"]
-        labels = tensors[_CONSTANTS.LABELS_KEY]
 
-        batch_index = tensors[_CONSTANTS.BATCH_KEY]
-        cont_key = _CONSTANTS.CONT_COVS_KEY
+        size_factor_key = REGISTRY_KEYS.SIZE_FACTOR_KEY
+        size_factor = (
+            torch.log(tensors[size_factor_key])
+            if size_factor_key in tensors.keys()
+            else None
+        )
+
+        batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
+        cont_key = REGISTRY_KEYS.CONT_COVS_KEY
         cont_covs = tensors[cont_key] if cont_key in tensors.keys() else None
 
-        cat_key = _CONSTANTS.CAT_COVS_KEY
+        cat_key = REGISTRY_KEYS.CAT_COVS_KEY
         cat_covs = tensors[cat_key] if cat_key in tensors.keys() else None
 
         if transform_batch is not None:
@@ -792,7 +787,7 @@ class MULTIVAE(BaseModuleClass):
             cont_covs=cont_covs,
             cat_covs=cat_covs,
             libsize_expr=libsize_expr,
-            labels=labels,
+            size_factor=size_factor,
         )
         return input_dict
 
@@ -805,7 +800,7 @@ class MULTIVAE(BaseModuleClass):
         cont_covs=None,
         cat_covs=None,
         libsize_expr=None,
-        labels=None,
+        size_factor=None,
         use_z_mean=False,
     ):
         """Runs the generative model."""
@@ -815,16 +810,23 @@ class MULTIVAE(BaseModuleClass):
             categorical_input = tuple()
 
         latent = z if not use_z_mean else qz_m
-        decoder_input = (
-            latent if cont_covs is None else torch.cat([latent, cont_covs], dim=-1)
-        )
+        if cont_covs is None:
+            decoder_input = latent
+        elif latent.dim() != cont_covs.dim():
+            decoder_input = torch.cat(
+                [latent, cont_covs.unsqueeze(0).expand(latent.size(0), -1, -1)], dim=-1
+            )
+        else:
+            decoder_input = torch.cat([latent, cont_covs], dim=-1)
 
         # Accessibility Decoder
         p = self.z_decoder_accessibility(decoder_input, batch_index, *categorical_input)
 
         # Expression Decoder
+        if not self.use_size_factor_key:
+            size_factor = libsize_expr
         px_scale, _, px_rate, px_dropout = self.z_decoder_expression(
-            "gene", decoder_input, libsize_expr, batch_index, *categorical_input, labels
+            "gene", decoder_input, size_factor, batch_index, *categorical_input
         )
 
         # Protein Decoder

@@ -3,53 +3,101 @@ import os
 import pickle
 import warnings
 from collections.abc import Iterable as IterableClass
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
+import anndata
+import mudata
 import numpy as np
 import pandas as pd
 import torch
 from anndata import AnnData, read
 
 from scvi._compat import Literal
-from scvi._constants import _CONSTANTS
-from scvi.utils import DifferentialComputation, track
+from scvi.data._constants import _SETUP_METHOD_NAME
+from scvi.data._download import _download
+from scvi.utils import track
+
+from ._differential import DifferentialComputation
 
 logger = logging.getLogger(__name__)
+
+
+def _load_legacy_saved_files(
+    dir_path: str,
+    file_name_prefix: str,
+    load_adata: bool,
+) -> Tuple[dict, np.ndarray, dict, Optional[AnnData]]:
+    model_path = os.path.join(dir_path, f"{file_name_prefix}model_params.pt")
+    var_names_path = os.path.join(dir_path, f"{file_name_prefix}var_names.csv")
+    setup_dict_path = os.path.join(dir_path, f"{file_name_prefix}attr.pkl")
+
+    model_state_dict = torch.load(model_path, map_location="cpu")
+
+    var_names = np.genfromtxt(var_names_path, delimiter=",", dtype=str)
+
+    with open(setup_dict_path, "rb") as handle:
+        attr_dict = pickle.load(handle)
+
+    if load_adata:
+        adata_path = os.path.join(dir_path, f"{file_name_prefix}adata.h5ad")
+        if os.path.exists(adata_path):
+            adata = read(adata_path)
+        elif not os.path.exists(adata_path):
+            raise ValueError(
+                "Save path contains no saved anndata and no adata was passed."
+            )
+    else:
+        adata = None
+
+    return model_state_dict, var_names, attr_dict, adata
 
 
 def _load_saved_files(
     dir_path: str,
     load_adata: bool,
+    prefix: Optional[str] = None,
     map_location: Optional[Literal["cpu", "cuda"]] = None,
-):
+    backup_url: Optional[str] = None,
+) -> Tuple[dict, np.ndarray, dict, AnnData]:
     """Helper to load saved files."""
-    setup_dict_path = os.path.join(dir_path, "attr.pkl")
-    adata_path = os.path.join(dir_path, "adata.h5ad")
-    varnames_path = os.path.join(dir_path, "var_names.csv")
-    model_path = os.path.join(dir_path, "model_params.pt")
+    file_name_prefix = prefix or ""
 
-    if os.path.exists(adata_path) and load_adata:
-        adata = read(adata_path)
-    elif not os.path.exists(adata_path) and load_adata:
-        raise ValueError("Save path contains no saved anndata and no adata was passed.")
+    model_file_name = f"{file_name_prefix}model.pt"
+    model_path = os.path.join(dir_path, model_file_name)
+    try:
+        _download(backup_url, dir_path, model_file_name)
+        model = torch.load(model_path, map_location=map_location)
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"Failed to load model file at {model_path}. "
+            "If attempting to load a saved model from <v0.15.0, please use the util function "
+            "`convert_legacy_save` to convert to an updated format."
+        ) from exc
+
+    model_state_dict = model["model_state_dict"]
+    var_names = model["var_names"]
+    attr_dict = model["attr_dict"]
+
+    is_mudata = False
+    registry = attr_dict["registry_"]
+    is_mudata = registry.get(_SETUP_METHOD_NAME) == "setup_mudata"
+    file_suffix = "adata.h5ad" if not is_mudata else "mdata.h5mu"
+    adata_path = os.path.join(dir_path, f"{file_name_prefix}{file_suffix}")
+
+    if load_adata:
+        if os.path.exists(adata_path):
+            if is_mudata:
+                adata = mudata.read(adata_path)
+            else:
+                adata = anndata.read(adata_path)
+        else:
+            raise ValueError(
+                "Save path contains no saved anndata and no adata was passed."
+            )
     else:
         adata = None
 
-    var_names = np.genfromtxt(varnames_path, delimiter=",", dtype=str)
-
-    with open(setup_dict_path, "rb") as handle:
-        attr_dict = pickle.load(handle)
-
-    scvi_setup_dict = attr_dict.pop("scvi_setup_dict_")
-    # Only retain keys in the data_registry that exist in _CONSTANTS.
-    # TODO(jhong): Remove once data registry refactored.
-    scvi_setup_dict["data_registry"] = {
-        k: v for k, v in scvi_setup_dict["data_registry"].items() if k in _CONSTANTS
-    }
-
-    model_state_dict = torch.load(model_path, map_location=map_location)
-
-    return scvi_setup_dict, attr_dict, var_names, model_state_dict, adata
+    return attr_dict, var_names, model_state_dict, adata
 
 
 def _initialize_model(cls, adata, attr_dict):
@@ -77,7 +125,16 @@ def _initialize_model(cls, adata, attr_dict):
         kwargs = {k: v for (i, j) in kwargs.items() for (k, v) in j.items()}
         non_kwargs.pop("use_cuda")
 
+    # backwards compat for scANVI
+    if "unlabeled_category" in non_kwargs.keys():
+        non_kwargs.pop("unlabeled_category")
+    if "pretrained_model" in non_kwargs.keys():
+        non_kwargs.pop("pretrained_model")
+
     model = cls(adata, **non_kwargs, **kwargs)
+    for attr, val in attr_dict.items():
+        setattr(model, attr, val)
+
     return model
 
 
@@ -95,7 +152,7 @@ def _validate_var_names(adata, source_var_names):
 def _prepare_obs(
     idx1: Union[List[bool], np.ndarray, str],
     idx2: Union[List[bool], np.ndarray, str],
-    adata: AnnData,
+    adata: anndata.AnnData,
 ):
     """
     Construct an array used for masking.
@@ -141,7 +198,7 @@ def _prepare_obs(
 
 
 def _de_core(
-    adata,
+    adata_manager,
     model_fn,
     groupby,
     group1,
@@ -158,9 +215,10 @@ def _de_core(
     batch_correction,
     fdr,
     silent,
-    **kwargs
+    **kwargs,
 ):
     """Internal function for DE interface."""
+    adata = adata_manager.adata
     if group1 is None and idx1 is None:
         group1 = adata.obs[groupby].astype("category").cat.categories.tolist()
         if len(group1) == 1:
@@ -180,7 +238,7 @@ def _de_core(
         groupby = temp_key
 
     df_results = []
-    dc = DifferentialComputation(model_fn, adata)
+    dc = DifferentialComputation(model_fn, adata_manager)
     for g1 in track(
         group1,
         description="DE...",
@@ -204,7 +262,7 @@ def _de_core(
         )
 
         if all_stats is True:
-            genes_properties_dict = all_stats_fn(adata, cell_idx1, cell_idx2)
+            genes_properties_dict = all_stats_fn(adata_manager, cell_idx1, cell_idx2)
             all_info = {**all_info, **genes_properties_dict}
 
         res = pd.DataFrame(all_info, index=col_names)

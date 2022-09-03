@@ -6,6 +6,8 @@ from torch import nn as nn
 from torch.distributions import Normal
 from torch.nn import ModuleList
 
+from scvi._compat import Literal
+
 from ._utils import one_hot
 
 
@@ -227,6 +229,8 @@ class Encoder(nn.Module):
     var_activation
         Callable used to ensure positivity of the variance.
         When `None`, defaults to `torch.exp`.
+    return_dist
+        If `True`, returns directly the distribution of z instead of its parameters.
     **kwargs
         Keyword args for :class:`~scvi.module._base.FCLayers`
     """
@@ -242,6 +246,7 @@ class Encoder(nn.Module):
         distribution: str = "normal",
         var_eps: float = 1e-4,
         var_activation: Optional[Callable] = None,
+        return_dist: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -259,6 +264,7 @@ class Encoder(nn.Module):
         )
         self.mean_encoder = nn.Linear(n_hidden, n_output)
         self.var_encoder = nn.Linear(n_hidden, n_output)
+        self.return_dist = return_dist
 
         if distribution == "ln":
             self.z_transformation = nn.Softmax(dim=-1)
@@ -291,14 +297,17 @@ class Encoder(nn.Module):
         q = self.encoder(x, *cat_list)
         q_m = self.mean_encoder(q)
         q_v = self.var_activation(self.var_encoder(q)) + self.var_eps
-        latent = self.z_transformation(reparameterize_gaussian(q_m, q_v))
+        dist = Normal(q_m, q_v.sqrt())
+        latent = self.z_transformation(dist.rsample())
+        if self.return_dist:
+            return dist, latent
         return q_m, q_v, latent
 
 
 # Decoder
 class DecoderSCVI(nn.Module):
     """
-    Decodes data from latent space of ``n_input`` dimensions ``n_output``dimensions.
+    Decodes data from latent space of ``n_input`` dimensions into ``n_output``dimensions.
 
     Uses a fully-connected neural network of ``n_hidden`` layers.
 
@@ -324,6 +333,8 @@ class DecoderSCVI(nn.Module):
         Whether to use batch norm in layers
     use_layer_norm
         Whether to use layer norm in layers
+    scale_activation
+        Activation layer to use for px_scale_decoder
     """
 
     def __init__(
@@ -336,6 +347,7 @@ class DecoderSCVI(nn.Module):
         inject_covariates: bool = True,
         use_batch_norm: bool = False,
         use_layer_norm: bool = False,
+        scale_activation: Literal["softmax", "softplus"] = "softmax",
     ):
         super().__init__()
         self.px_decoder = FCLayers(
@@ -351,9 +363,13 @@ class DecoderSCVI(nn.Module):
         )
 
         # mean gamma
+        if scale_activation == "softmax":
+            px_scale_activation = nn.Softmax(dim=-1)
+        elif scale_activation == "softplus":
+            px_scale_activation = nn.Softplus()
         self.px_scale_decoder = nn.Sequential(
             nn.Linear(n_hidden, n_output),
-            nn.Softmax(dim=-1),
+            px_scale_activation,
         )
 
         # dispersion: here we only deal with gene-cell dispersion case
@@ -363,7 +379,11 @@ class DecoderSCVI(nn.Module):
         self.px_dropout_decoder = nn.Linear(n_hidden, n_output)
 
     def forward(
-        self, dispersion: str, z: torch.Tensor, library: torch.Tensor, *cat_list: int
+        self,
+        dispersion: str,
+        z: torch.Tensor,
+        library: torch.Tensor,
+        *cat_list: int,
     ):
         """
         The forward computation for a single sample.
@@ -383,7 +403,7 @@ class DecoderSCVI(nn.Module):
             * ``'gene-cell'`` - dispersion can differ for every gene in every cell
         z :
             tensor with shape ``(n_input,)``
-        library
+        library_size
             library size
         cat_list
             list of category membership(s) for this sample
@@ -545,6 +565,7 @@ class MultiEncoder(nn.Module):
         n_layers_shared: int = 2,
         n_cat_list: Iterable[int] = None,
         dropout_rate: float = 0.1,
+        return_dist: bool = False,
     ):
         super().__init__()
 
@@ -574,6 +595,7 @@ class MultiEncoder(nn.Module):
 
         self.mean_encoder = nn.Linear(n_hidden, n_output)
         self.var_encoder = nn.Linear(n_hidden, n_output)
+        self.return_dist = return_dist
 
     def forward(self, x: torch.Tensor, head_id: int, *cat_list: int):
         q = self.encoders[head_id](x, *cat_list)
@@ -581,8 +603,10 @@ class MultiEncoder(nn.Module):
 
         q_m = self.mean_encoder(q)
         q_v = torch.exp(self.var_encoder(q))
-        latent = reparameterize_gaussian(q_m, q_v)
-
+        dist = Normal(q_m, q_v.sqrt())
+        latent = dist.rsample()
+        if self.return_dist:
+            return dist, latent
         return q_m, q_v, latent
 
 
@@ -681,6 +705,8 @@ class DecoderTOTALVI(nn.Module):
         Whether to use batch norm in layers
     use_layer_norm
         Whether to use layer norm in layers
+    scale_activation
+        Activation layer to use for px_scale_decoder
     """
 
     def __init__(
@@ -694,6 +720,7 @@ class DecoderTOTALVI(nn.Module):
         dropout_rate: float = 0,
         use_batch_norm: float = True,
         use_layer_norm: float = False,
+        scale_activation: Literal["softmax", "softplus"] = "softmax",
     ):
         super().__init__()
         self.n_output_genes = n_output_genes
@@ -725,6 +752,10 @@ class DecoderTOTALVI(nn.Module):
             n_cat_list=n_cat_list,
             **linear_args,
         )
+        if scale_activation == "softmax":
+            self.px_scale_activation = nn.Softmax(dim=-1)
+        elif scale_activation == "softplus":
+            self.px_scale_activation = nn.Softplus()
 
         # background mean first decoder
         self.py_back_decoder = FCLayers(
@@ -840,7 +871,7 @@ class DecoderTOTALVI(nn.Module):
         px = self.px_decoder(z, *cat_list)
         px_cat_z = torch.cat([px, z], dim=-1)
         unnorm_px_scale = self.px_scale_decoder(px_cat_z, *cat_list)
-        px_["scale"] = nn.Softmax(dim=-1)(unnorm_px_scale)
+        px_["scale"] = self.px_scale_activation(unnorm_px_scale)
         px_["rate"] = library_gene * px_["scale"]
 
         py_back = self.py_back_decoder(z, *cat_list)
@@ -991,12 +1022,16 @@ class EncoderTOTALVI(nn.Module):
         q = self.encoder(data, *cat_list)
         qz_m = self.z_mean_encoder(q)
         qz_v = torch.exp(self.z_var_encoder(q)) + 1e-4
-        z, untran_z = self.reparameterize_transformation(qz_m, qz_v)
+        q_z = Normal(qz_m, qz_v.sqrt())
+        untran_z = q_z.rsample()
+        z = self.z_transformation(untran_z)
 
         ql_gene = self.l_gene_encoder(data, *cat_list)
         ql_m = self.l_gene_mean_encoder(ql_gene)
         ql_v = torch.exp(self.l_gene_var_encoder(ql_gene)) + 1e-4
-        log_library_gene = torch.clamp(reparameterize_gaussian(ql_m, ql_v), max=15)
+        q_l = Normal(ql_m, ql_v.sqrt())
+        log_library_gene = q_l.rsample()
+        log_library_gene = torch.clamp(log_library_gene, max=15)
         library_gene = self.l_transformation(log_library_gene)
 
         latent = {}
@@ -1006,4 +1041,4 @@ class EncoderTOTALVI(nn.Module):
         untran_latent["z"] = untran_z
         untran_latent["l"] = log_library_gene
 
-        return qz_m, qz_v, ql_m, ql_v, latent, untran_latent
+        return q_z, q_l, latent, untran_latent

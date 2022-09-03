@@ -2,34 +2,36 @@ import logging
 import warnings
 from collections.abc import Iterable as IterableClass
 from functools import partial
-from typing import Dict, Iterable, Optional, Sequence, Tuple, TypeVar, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import torch
 from anndata import AnnData
+from mudata import MuData
 
-from scvi import _CONSTANTS
+import scvi.data.fields as fields
+from scvi import REGISTRY_KEYS
 from scvi._compat import Literal
-from scvi._docs import doc_differential_expression
+from scvi._types import Number
 from scvi._utils import _doc_params
-from scvi.data import get_from_registry
+from scvi.data import AnnDataManager
 from scvi.data._utils import _check_nonnegative_integers
 from scvi.dataloaders import DataSplitter
 from scvi.model._utils import (
     _get_batch_code_from_category,
-    _get_var_names_from_setup_anndata,
+    _get_var_names_from_manager,
     _init_library_size,
     cite_seq_raw_counts_properties,
 )
 from scvi.model.base._utils import _de_core
 from scvi.module import TOTALVAE
 from scvi.train import AdversarialTrainingPlan, TrainRunner
+from scvi.utils._docstrings import doc_differential_expression, setup_anndata_dsp
 
 from .base import ArchesMixin, BaseModelClass, RNASeqMixin, VAEMixin
 
 logger = logging.getLogger(__name__)
-Number = TypeVar("Number", int, float)
 
 
 class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
@@ -39,7 +41,7 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
     Parameters
     ----------
     adata
-        AnnData object that has been registered via :func:`~scvi.data.setup_anndata`.
+        AnnData object that has been registered via :meth:`~scvi.model.TOTALVI.setup_anndata`.
     n_latent
         Dimensionality of the latent space.
     gene_dispersion
@@ -69,13 +71,15 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         100 cells per batch and averages the distributions. Note that even with this option set to `True`,
         this only initializes a parameter that is learned during inference. If `False`, randomly initializes.
         The default (`None`), sets this to `True` if greater than 10 proteins are used.
+    override_missing_proteins
+        If `True`, will not treat proteins with all 0 expression in a particular batch as missing.
     **model_kwargs
         Keyword args for :class:`~scvi.module.TOTALVAE`
 
     Examples
     --------
     >>> adata = anndata.read_h5ad(path_to_anndata)
-    >>> scvi.data.setup_anndata(adata, batch_key="batch", protein_expression_obsm_key="protein_expression")
+    >>> scvi.model.TOTALVI.setup_anndata(adata, batch_key="batch", protein_expression_obsm_key="protein_expression")
     >>> vae = scvi.model.TOTALVI(adata)
     >>> vae.train()
     >>> adata.obsm["X_totalVI"] = vae.get_latent_representation()
@@ -84,9 +88,9 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
     -----
     See further usage examples in the following tutorials:
 
-    1. :doc:`/user_guide/notebooks/totalVI`
-    2. :doc:`/user_guide/notebooks/cite_scrna_integration_w_totalVI`
-    3. :doc:`/user_guide/notebooks/scarches_scvi_tools`
+    1. :doc:`/tutorials/notebooks/totalVI`
+    2. :doc:`/tutorials/notebooks/cite_scrna_integration_w_totalVI`
+    3. :doc:`/tutorials/notebooks/scarches_scvi_tools`
     """
 
     def __init__(
@@ -102,38 +106,65 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         gene_likelihood: Literal["zinb", "nb"] = "nb",
         latent_distribution: Literal["normal", "ln"] = "normal",
         empirical_protein_background_prior: Optional[bool] = None,
+        override_missing_proteins: bool = False,
         **model_kwargs,
     ):
         super(TOTALVI, self).__init__(adata)
-        if "totalvi_batch_mask" in self.scvi_setup_dict_.keys():
-            batch_mask = self.scvi_setup_dict_["totalvi_batch_mask"]
+        self.protein_state_registry = self.adata_manager.get_state_registry(
+            REGISTRY_KEYS.PROTEIN_EXP_KEY
+        )
+        if (
+            fields.ProteinObsmField.PROTEIN_BATCH_MASK in self.protein_state_registry
+            and not override_missing_proteins
+        ):
+            batch_mask = self.protein_state_registry.protein_batch_mask
+            msg = (
+                "Some proteins have all 0 counts in some batches. "
+                + "These proteins will be treated as missing measurements; however, "
+                + "this can occur due to experimental design/biology. "
+                + "Reinitialize the model with `override_missing_proteins=True`,"
+                + "to override this behavior."
+            )
+            warnings.warn(msg, UserWarning)
+            self._use_adversarial_classifier = True
         else:
             batch_mask = None
+            self._use_adversarial_classifier = False
+
         emp_prior = (
             empirical_protein_background_prior
             if empirical_protein_background_prior is not None
-            else (self.summary_stats["n_proteins"] > 10)
+            else (self.summary_stats.n_proteins > 10)
         )
         if emp_prior:
-            prior_mean, prior_scale = _get_totalvi_protein_priors(adata)
+            prior_mean, prior_scale = self._get_totalvi_protein_priors(adata)
         else:
             prior_mean, prior_scale = None, None
 
         n_cats_per_cov = (
-            self.scvi_setup_dict_["extra_categoricals"]["n_cats_per_key"]
-            if "extra_categoricals" in self.scvi_setup_dict_
+            self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY)[
+                fields.CategoricalJointObsField.N_CATS_PER_KEY
+            ]
+            if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry
             else None
         )
 
-        n_batch = self.summary_stats["n_batch"]
-        library_log_means, library_log_vars = _init_library_size(adata, n_batch)
+        n_batch = self.summary_stats.n_batch
+        use_size_factor_key = (
+            REGISTRY_KEYS.SIZE_FACTOR_KEY in self.adata_manager.data_registry
+        )
+        library_log_means, library_log_vars = None, None
+        if not use_size_factor_key:
+            library_log_means, library_log_vars = _init_library_size(
+                self.adata_manager, n_batch
+            )
 
         self.module = TOTALVAE(
-            n_input_genes=self.summary_stats["n_vars"],
-            n_input_proteins=self.summary_stats["n_proteins"],
+            n_input_genes=self.summary_stats.n_vars,
+            n_input_proteins=self.summary_stats.n_proteins,
             n_batch=n_batch,
             n_latent=n_latent,
-            n_continuous_cov=self.summary_stats["n_continuous_covs"],
+            n_continuous_cov=self.summary_stats.get("n_extra_continuous_covs", 0),
             n_cats_per_cov=n_cats_per_cov,
             gene_dispersion=gene_dispersion,
             protein_dispersion=protein_dispersion,
@@ -142,6 +173,7 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             protein_batch_mask=batch_mask,
             protein_background_prior_mean=prior_mean,
             protein_background_prior_scale=prior_scale,
+            use_size_factor_key=use_size_factor_key,
             library_log_means=library_log_means,
             library_log_vars=library_log_vars,
             **model_kwargs,
@@ -160,7 +192,7 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
 
     def train(
         self,
-        max_epochs: Optional[int] = 400,
+        max_epochs: Optional[int] = None,
         lr: float = 4e-3,
         use_gpu: Optional[Union[str, int, bool]] = None,
         train_size: float = 0.9,
@@ -220,10 +252,7 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             Other keyword args for :class:`~scvi.train.Trainer`.
         """
         if adversarial_classifier is None:
-            imputation = (
-                True if "totalvi_batch_mask" in self.scvi_setup_dict_.keys() else False
-            )
-            adversarial_classifier = True if imputation else False
+            adversarial_classifier = self._use_adversarial_classifier
         n_steps_kl_warmup = (
             n_steps_kl_warmup
             if n_steps_kl_warmup is not None
@@ -238,7 +267,6 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             "reduce_lr_on_plateau": reduce_lr_on_plateau,
             "n_epochs_kl_warmup": n_epochs_kl_warmup,
             "n_steps_kl_warmup": n_steps_kl_warmup,
-            "check_val_every_n_epoch": check_val_every_n_epoch,
         }
         if plan_kwargs is not None:
             plan_kwargs.update(update_dict)
@@ -252,7 +280,7 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         plan_kwargs = plan_kwargs if isinstance(plan_kwargs, dict) else dict()
 
         data_splitter = DataSplitter(
-            self.adata,
+            self.adata_manager,
             train_size=train_size,
             validation_size=validation_size,
             batch_size=batch_size,
@@ -266,6 +294,7 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             max_epochs=max_epochs,
             use_gpu=use_gpu,
             early_stopping=early_stopping,
+            check_val_every_n_epoch=check_val_every_n_epoch,
             **kwargs,
         )
         return runner()
@@ -295,21 +324,20 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         batch_size
             Minibatch size for data loading into model. Defaults to `scvi.settings.batch_size`.
         """
-        if not self.is_trained_:
-            raise RuntimeError("Please train the model first.")
+        self._check_if_trained(warn=False)
 
         adata = self._validate_anndata(adata)
         post = self._make_data_loader(
             adata=adata, indices=indices, batch_size=batch_size
         )
+
         libraries = []
         for tensors in post:
             inference_inputs = self.module._get_inference_input(tensors)
             outputs = self.module.inference(**inference_inputs)
             if give_mean:
-                ql_m = outputs["ql_m"]
-                ql_v = outputs["ql_v"]
-                library = torch.exp(ql_m + 0.5 * ql_v)
+                ql = outputs["ql"]
+                library = torch.exp(ql.loc + 0.5 * (ql.scale**2))
             else:
                 library = outputs["library_gene"]
             libraries += [library.cpu()]
@@ -393,6 +421,7 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         Otherwise, shape is ``(cells, genes)``. Return type is ``pd.DataFrame`` unless ``return_numpy`` is True.
         """
         adata = self._validate_anndata(adata)
+        adata_manager = self.get_anndata_manager(adata)
         if indices is None:
             indices = np.arange(adata.n_obs)
         if n_samples_overall is not None:
@@ -404,12 +433,12 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         if gene_list is None:
             gene_mask = slice(None)
         else:
-            all_genes = _get_var_names_from_setup_anndata(adata)
+            all_genes = _get_var_names_from_manager(adata_manager)
             gene_mask = [True if gene in gene_list else False for gene in all_genes]
         if protein_list is None:
             protein_mask = slice(None)
         else:
-            all_proteins = self.scvi_setup_dict_["protein_names"]
+            all_proteins = self.protein_state_registry.column_names
             protein_mask = [True if p in protein_list else False for p in all_proteins]
         if indices is None:
             indices = np.arange(adata.n_obs)
@@ -424,16 +453,16 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         if not isinstance(transform_batch, IterableClass):
             transform_batch = [transform_batch]
 
-        transform_batch = _get_batch_code_from_category(adata, transform_batch)
+        transform_batch = _get_batch_code_from_category(adata_manager, transform_batch)
 
         scale_list_gene = []
         scale_list_pro = []
 
         for tensors in post:
-            x = tensors[_CONSTANTS.X_KEY]
-            y = tensors[_CONSTANTS.PROTEIN_EXP_KEY]
-            px_scale = torch.zeros_like(x)
-            py_scale = torch.zeros_like(y)
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
+            px_scale = torch.zeros_like(x)[..., gene_mask]
+            py_scale = torch.zeros_like(y)[..., protein_mask]
             if n_samples > 1:
                 px_scale = torch.stack(n_samples * [px_scale])
                 py_scale = torch.stack(n_samples * [py_scale])
@@ -447,10 +476,9 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
                     compute_loss=False,
                 )
                 if library_size == "latent":
-                    px_scale += generative_outputs["px_"]["rate"].cpu()
+                    px_scale += generative_outputs["px_"]["rate"].cpu()[..., gene_mask]
                 else:
-                    px_scale += generative_outputs["px_"]["scale"].cpu()
-                px_scale = px_scale[..., gene_mask]
+                    px_scale += generative_outputs["px_"]["scale"].cpu()[..., gene_mask]
 
                 py_ = generative_outputs["py_"]
                 # probability of background
@@ -494,12 +522,13 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         if return_numpy is None or return_numpy is False:
             gene_df = pd.DataFrame(
                 scale_list_gene,
-                columns=adata.var_names[gene_mask],
+                columns=_get_var_names_from_manager(adata_manager)[gene_mask],
                 index=adata.obs_names[indices],
             )
+            protein_names = self.protein_state_registry.column_names
             pro_df = pd.DataFrame(
                 scale_list_pro,
-                columns=self.scvi_setup_dict_["protein_names"][protein_mask],
+                columns=protein_names[protein_mask],
                 index=adata.obs_names[indices],
             )
 
@@ -568,7 +597,7 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         if protein_list is None:
             protein_mask = slice(None)
         else:
-            all_proteins = self.scvi_setup_dict_["protein_names"]
+            all_proteins = self.protein_state_registry.column_names
             protein_mask = [True if p in protein_list else False for p in all_proteins]
 
         if n_samples > 1 and return_mean is False:
@@ -584,9 +613,11 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         if not isinstance(transform_batch, IterableClass):
             transform_batch = [transform_batch]
 
-        transform_batch = _get_batch_code_from_category(adata, transform_batch)
+        transform_batch = _get_batch_code_from_category(
+            self.adata_manager, transform_batch
+        )
         for tensors in post:
-            y = tensors[_CONSTANTS.PROTEIN_EXP_KEY]
+            y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
             py_mixing = torch.zeros_like(y[..., protein_mask])
             if n_samples > 1:
                 py_mixing = torch.stack(n_samples * [py_mixing])
@@ -620,7 +651,7 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         if return_numpy is True:
             return 1 - py_mixings
         else:
-            pro_names = self.scvi_setup_dict_["protein_names"]
+            pro_names = self.protein_state_registry.column_names
             foreground_prob = pd.DataFrame(
                 1 - py_mixings,
                 columns=pro_names[protein_mask],
@@ -701,13 +732,14 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         include_protein_background
             Include the protein background component as part of the protein expression
         **kwargs
-            Keyword args for :func:`scvi.utils.DifferentialComputation.get_bayes_factors`
+            Keyword args for :meth:`scvi.model.base.DifferentialComputation.get_bayes_factors`
 
         Returns
         -------
         Differential expression DataFrame.
         """
         adata = self._validate_anndata(adata)
+        adata_manager = self.get_anndata_manager(adata, required=True)
         model_fn = partial(
             self._expression_for_de,
             scale_protein=scale_protein,
@@ -718,12 +750,12 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         )
         col_names = np.concatenate(
             [
-                np.asarray(_get_var_names_from_setup_anndata(adata)),
-                self.scvi_setup_dict_["protein_names"],
+                np.asarray(_get_var_names_from_manager(adata_manager)),
+                self.protein_state_registry.column_names,
             ]
         )
         result = _de_core(
-            adata,
+            adata_manager,
             model_fn,
             groupby,
             group1,
@@ -785,15 +817,16 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             raise ValueError("Invalid gene_likelihood")
 
         adata = self._validate_anndata(adata)
+        adata_manager = self.get_anndata_manager(adata, required=True)
         if gene_list is None:
             gene_mask = slice(None)
         else:
-            all_genes = _get_var_names_from_setup_anndata(adata)
+            all_genes = _get_var_names_from_manager(adata_manager)
             gene_mask = [True if gene in gene_list else False for gene in all_genes]
         if protein_list is None:
             protein_mask = slice(None)
         else:
-            all_proteins = self.scvi_setup_dict_["protein_names"]
+            all_proteins = self.protein_state_registry.column_names
             protein_mask = [True if p in protein_list else False for p in all_proteins]
 
         scdl = self._make_data_loader(
@@ -852,8 +885,8 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
 
         scdl_list = []
         for tensors in scdl:
-            x = tensors[_CONSTANTS.X_KEY]
-            y = tensors[_CONSTANTS.PROTEIN_EXP_KEY]
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
 
             generative_kwargs = dict(transform_batch=transform_batch)
             inference_kwargs = dict(n_samples=n_samples)
@@ -889,8 +922,8 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             l_train = torch.distributions.Gamma(r, (1 - p) / p).sample()
             data = l_train.cpu().numpy()
             # make background 0
-            data[:, :, self.adata.shape[1] :] = (
-                data[:, :, self.adata.shape[1] :] * (1 - mixing_sample).cpu().numpy()
+            data[:, :, x.shape[1] :] = (
+                data[:, :, x.shape[1] :] * (1 - mixing_sample).cpu().numpy()
             )
             scdl_list += [data]
 
@@ -945,11 +978,14 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
         from scipy.stats import spearmanr
 
         adata = self._validate_anndata(adata)
+        adata_manager = self.get_anndata_manager(adata, required=True)
 
         if not isinstance(transform_batch, IterableClass):
             transform_batch = [transform_batch]
 
-        transform_batch = _get_batch_code_from_category(adata, transform_batch)
+        transform_batch = _get_batch_code_from_category(
+            self.get_anndata_manager(adata, required=True), transform_batch
+        )
 
         corr_mats = []
         for b in transform_batch:
@@ -978,9 +1014,12 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             corr_mats.append(corr_matrix)
 
         corr_matrix = np.mean(np.stack(corr_mats), axis=0)
-        var_names = _get_var_names_from_setup_anndata(adata)
+        var_names = _get_var_names_from_manager(adata_manager)
         names = np.concatenate(
-            [np.asarray(var_names), self.scvi_setup_dict_["protein_names"]]
+            [
+                np.asarray(var_names),
+                self.protein_state_registry.column_names,
+            ]
         )
         return pd.DataFrame(corr_matrix, index=names, columns=names)
 
@@ -1015,11 +1054,11 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
     def _validate_anndata(
         self, adata: Optional[AnnData] = None, copy_if_view: bool = True
     ):
-        adata = super()._validate_anndata(adata, copy_if_view)
+        adata = super()._validate_anndata(adata=adata, copy_if_view=copy_if_view)
         error_msg = "Number of {} in anndata different from when setup_anndata was run. Please rerun setup_anndata."
-        if _CONSTANTS.PROTEIN_EXP_KEY in adata.uns["_scvi"]["data_registry"].keys():
-            pro_exp = get_from_registry(adata, _CONSTANTS.PROTEIN_EXP_KEY)
-            if self.summary_stats["n_proteins"] != pro_exp.shape[1]:
+        if REGISTRY_KEYS.PROTEIN_EXP_KEY in self.adata_manager.data_registry.keys():
+            pro_exp = self.get_from_registry(adata, REGISTRY_KEYS.PROTEIN_EXP_KEY)
+            if self.summary_stats.n_proteins != pro_exp.shape[1]:
                 raise ValueError(error_msg.format("proteins"))
             is_nonneg_int = _check_nonnegative_integers(pro_exp)
             if not is_nonneg_int:
@@ -1030,6 +1069,103 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             raise ValueError("No protein data found, please setup or transfer anndata")
 
         return adata
+
+    def _get_totalvi_protein_priors(self, adata, n_cells=100):
+        """Compute an empirical prior for protein background."""
+
+        from sklearn.exceptions import ConvergenceWarning
+        from sklearn.mixture import GaussianMixture
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error")
+            logger.info(
+                "Computing empirical prior initialization for protein background."
+            )
+
+            adata = self._validate_anndata(adata)
+            adata_manager = self.get_anndata_manager(adata)
+            pro_exp = adata_manager.get_from_registry(REGISTRY_KEYS.PROTEIN_EXP_KEY)
+            pro_exp = (
+                pro_exp.to_numpy() if isinstance(pro_exp, pd.DataFrame) else pro_exp
+            )
+            batch_mask = adata_manager.get_state_registry(
+                REGISTRY_KEYS.PROTEIN_EXP_KEY
+            ).get(fields.ProteinObsmField.PROTEIN_BATCH_MASK)
+            batch = adata_manager.get_from_registry(REGISTRY_KEYS.BATCH_KEY).ravel()
+            cats = adata_manager.get_state_registry(REGISTRY_KEYS.BATCH_KEY)[
+                fields.CategoricalObsField.CATEGORICAL_MAPPING_KEY
+            ]
+            codes = np.arange(len(cats))
+
+            batch_avg_mus, batch_avg_scales = [], []
+            for b in np.unique(codes):
+                # can happen during online updates
+                # the values of these batches will not be used
+                num_in_batch = np.sum(batch == b)
+                if num_in_batch == 0:
+                    batch_avg_mus.append(0)
+                    batch_avg_scales.append(1)
+                    continue
+                batch_pro_exp = pro_exp[batch == b]
+
+                # non missing
+                if batch_mask is not None:
+                    batch_pro_exp = batch_pro_exp[:, batch_mask[b]]
+                    if batch_pro_exp.shape[1] < 5:
+                        logger.debug(
+                            f"Batch {b} has too few proteins to set prior, setting randomly."
+                        )
+                        batch_avg_mus.append(0.0)
+                        batch_avg_scales.append(0.05)
+                        continue
+
+                # a batch is missing because it's in the reference but not query data
+                # for scarches case, these values will be replaced by original state dict
+                if batch_pro_exp.shape[0] == 0:
+                    batch_avg_mus.append(0.0)
+                    batch_avg_scales.append(0.05)
+                    continue
+
+                cells = np.random.choice(
+                    np.arange(batch_pro_exp.shape[0]), size=n_cells
+                )
+                batch_pro_exp = batch_pro_exp[cells]
+                gmm = GaussianMixture(n_components=2)
+                mus, scales = [], []
+                # fit per cell GMM
+                for c in batch_pro_exp:
+                    try:
+                        gmm.fit(np.log1p(c.reshape(-1, 1)))
+                    # when cell is all 0
+                    except ConvergenceWarning:
+                        mus.append(0)
+                        scales.append(0.05)
+                        continue
+
+                    means = gmm.means_.ravel()
+                    sorted_fg_bg = np.argsort(means)
+                    mu = means[sorted_fg_bg].ravel()[0]
+                    covariances = gmm.covariances_[sorted_fg_bg].ravel()[0]
+                    scale = np.sqrt(covariances)
+                    mus.append(mu)
+                    scales.append(scale)
+
+                # average distribution over cells
+                batch_avg_mu = np.mean(mus)
+                batch_avg_scale = np.sqrt(np.sum(np.square(scales)) / (n_cells**2))
+
+                batch_avg_mus.append(batch_avg_mu)
+                batch_avg_scales.append(batch_avg_scale)
+
+            # repeat prior for each protein
+            batch_avg_mus = np.array(batch_avg_mus, dtype=np.float32).reshape(1, -1)
+            batch_avg_scales = np.array(batch_avg_scales, dtype=np.float32).reshape(
+                1, -1
+            )
+            batch_avg_mus = np.tile(batch_avg_mus, (pro_exp.shape[1], 1))
+            batch_avg_scales = np.tile(batch_avg_scales, (pro_exp.shape[1], 1))
+
+        return batch_avg_mus, batch_avg_scales
 
     @torch.no_grad()
     def get_protein_background_mean(self, adata, indices, batch_size):
@@ -1044,73 +1180,140 @@ class TOTALVI(RNASeqMixin, VAEMixin, ArchesMixin, BaseModelClass):
             background_mean += [b_mean.cpu().numpy()]
         return np.concatenate(background_mean)
 
+    @classmethod
+    @setup_anndata_dsp.dedent
+    def setup_anndata(
+        cls,
+        adata: AnnData,
+        protein_expression_obsm_key: str,
+        protein_names_uns_key: Optional[str] = None,
+        batch_key: Optional[str] = None,
+        layer: Optional[str] = None,
+        size_factor_key: Optional[str] = None,
+        categorical_covariate_keys: Optional[List[str]] = None,
+        continuous_covariate_keys: Optional[List[str]] = None,
+        **kwargs,
+    ) -> Optional[AnnData]:
+        """
+        %(summary)s.
 
-def _get_totalvi_protein_priors(adata, n_cells=100):
-    """Compute an empirical prior for protein background."""
-    import warnings
+        Parameters
+        ----------
+        %(param_adata)s
+        protein_expression_obsm_key
+            key in `adata.obsm` for protein expression data.
+        protein_names_uns_key
+            key in `adata.uns` for protein names. If None, will use the column names of `adata.obsm[protein_expression_obsm_key]`
+            if it is a DataFrame, else will assign sequential names to proteins.
+        %(param_batch_key)s
+        %(param_layer)s
+        %(param_size_factor_key)s
+        %(param_cat_cov_keys)s
+        %(param_cont_cov_keys)s
+        %(param_copy)s
 
-    from sklearn.exceptions import ConvergenceWarning
-    from sklearn.mixture import GaussianMixture
+        Returns
+        -------
+        %(returns)s
+        """
+        setup_method_args = cls._get_setup_method_args(**locals())
+        batch_field = fields.CategoricalObsField(REGISTRY_KEYS.BATCH_KEY, batch_key)
+        anndata_fields = [
+            fields.LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
+            fields.CategoricalObsField(
+                REGISTRY_KEYS.LABELS_KEY, None
+            ),  # Default labels field for compatibility with TOTALVAE
+            batch_field,
+            fields.NumericalObsField(
+                REGISTRY_KEYS.SIZE_FACTOR_KEY, size_factor_key, required=False
+            ),
+            fields.CategoricalJointObsField(
+                REGISTRY_KEYS.CAT_COVS_KEY, categorical_covariate_keys
+            ),
+            fields.NumericalJointObsField(
+                REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys
+            ),
+            fields.ProteinObsmField(
+                REGISTRY_KEYS.PROTEIN_EXP_KEY,
+                protein_expression_obsm_key,
+                use_batch_mask=True,
+                batch_field=batch_field,
+                colnames_uns_key=protein_names_uns_key,
+                is_count_data=True,
+            ),
+        ]
+        adata_manager = AnnDataManager(
+            fields=anndata_fields, setup_method_args=setup_method_args
+        )
+        adata_manager.register_fields(adata, **kwargs)
+        cls.register_manager(adata_manager)
 
-    warnings.filterwarnings("error")
+    @classmethod
+    def setup_mudata(
+        cls,
+        mdata: MuData,
+        rna_layer: Optional[str] = None,
+        protein_layer: Optional[str] = None,
+        batch_key: Optional[str] = None,
+        size_factor_key: Optional[str] = None,
+        categorical_covariate_keys: Optional[List[str]] = None,
+        continuous_covariate_keys: Optional[List[str]] = None,
+        modalities: Optional[Dict[str, str]] = None,
+        **kwargs,
+    ) -> Optional[AnnData]:
+        setup_method_args = cls._get_setup_method_args(**locals())
 
-    batch = get_from_registry(adata, _CONSTANTS.BATCH_KEY).ravel()
-    cats = adata.uns["_scvi"]["categorical_mappings"]["_scvi_batch"]["mapping"]
-    codes = np.arange(len(cats))
+        if modalities is None:
+            raise ValueError("Modalities cannot be None.")
+        modalities = cls._create_modalities_attr_dict(modalities, setup_method_args)
 
-    batch_avg_mus, batch_avg_scales = [], []
-    for b in np.unique(codes):
-        # can happen during online updates
-        # the values of these batches will not be used
-        num_in_batch = np.sum(batch == b)
-        if num_in_batch == 0:
-            batch_avg_mus.append(0)
-            batch_avg_scales.append(1)
-            continue
-        pro_exp = get_from_registry(adata, _CONSTANTS.PROTEIN_EXP_KEY)[batch == b]
-
-        # for missing batches, put dummy values -- scarches case, will be replaced anyway
-        if pro_exp.shape[0] == 0:
-            batch_avg_mus.append(0.0)
-            batch_avg_scales.append(0.05)
-
-        cells = np.random.choice(np.arange(pro_exp.shape[0]), size=n_cells)
-        if isinstance(pro_exp, pd.DataFrame):
-            pro_exp = pro_exp.to_numpy()
-        pro_exp = pro_exp[cells]
-        gmm = GaussianMixture(n_components=2)
-        mus, scales = [], []
-        # fit per cell GMM
-        for c in pro_exp:
-            try:
-                gmm.fit(np.log1p(c.reshape(-1, 1)))
-            # when cell is all 0
-            except ConvergenceWarning:
-                mus.append(0)
-                scales.append(0.05)
-                continue
-
-            means = gmm.means_.ravel()
-            sorted_fg_bg = np.argsort(means)
-            mu = means[sorted_fg_bg].ravel()[0]
-            covariances = gmm.covariances_[sorted_fg_bg].ravel()[0]
-            scale = np.sqrt(covariances)
-            mus.append(mu)
-            scales.append(scale)
-
-        # average distribution over cells
-        batch_avg_mu = np.mean(mus)
-        batch_avg_scale = np.sqrt(np.sum(np.square(scales)) / (n_cells ** 2))
-
-        batch_avg_mus.append(batch_avg_mu)
-        batch_avg_scales.append(batch_avg_scale)
-
-    # repeat prior for each protein
-    batch_avg_mus = np.array(batch_avg_mus, dtype=np.float32).reshape(1, -1)
-    batch_avg_scales = np.array(batch_avg_scales, dtype=np.float32).reshape(1, -1)
-    batch_avg_mus = np.tile(batch_avg_mus, (pro_exp.shape[1], 1))
-    batch_avg_scales = np.tile(batch_avg_scales, (pro_exp.shape[1], 1))
-
-    warnings.resetwarnings()
-
-    return batch_avg_mus, batch_avg_scales
+        batch_field = fields.MuDataCategoricalObsField(
+            REGISTRY_KEYS.BATCH_KEY,
+            batch_key,
+            mod_key=modalities.batch_key,
+        )
+        mudata_fields = [
+            fields.MuDataLayerField(
+                REGISTRY_KEYS.X_KEY,
+                rna_layer,
+                mod_key=modalities.rna_layer,
+                is_count_data=True,
+                mod_required=True,
+            ),
+            fields.MuDataCategoricalObsField(
+                REGISTRY_KEYS.LABELS_KEY,
+                None,
+                mod_key=None,
+            ),  # Default labels field for compatibility with TOTALVAE
+            batch_field,
+            fields.MuDataNumericalObsField(
+                REGISTRY_KEYS.SIZE_FACTOR_KEY,
+                size_factor_key,
+                mod_key=modalities.size_factor_key,
+                required=False,
+            ),
+            fields.MuDataCategoricalJointObsField(
+                REGISTRY_KEYS.CAT_COVS_KEY,
+                categorical_covariate_keys,
+                mod_key=modalities.categorical_covariate_keys,
+            ),
+            fields.MuDataNumericalJointObsField(
+                REGISTRY_KEYS.CONT_COVS_KEY,
+                continuous_covariate_keys,
+                mod_key=modalities.continuous_covariate_keys,
+            ),
+            fields.MuDataProteinLayerField(
+                REGISTRY_KEYS.PROTEIN_EXP_KEY,
+                protein_layer,
+                mod_key=modalities.protein_layer,
+                use_batch_mask=True,
+                batch_field=batch_field,
+                is_count_data=True,
+                mod_required=True,
+            ),
+        ]
+        adata_manager = AnnDataManager(
+            fields=mudata_fields, setup_method_args=setup_method_args
+        )
+        adata_manager.register_fields(mdata, **kwargs)
+        cls.register_manager(adata_manager)

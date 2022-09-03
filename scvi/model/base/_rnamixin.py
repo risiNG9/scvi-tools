@@ -9,21 +9,16 @@ import pandas as pd
 import torch
 from anndata import AnnData
 
-from scvi import _CONSTANTS
+from scvi import REGISTRY_KEYS
 from scvi._compat import Literal
-from scvi._docs import doc_differential_expression
+from scvi._types import Number
 from scvi._utils import _doc_params
+from scvi.utils._docstrings import doc_differential_expression
 
-from .._utils import (
-    _get_batch_code_from_category,
-    _get_var_names_from_setup_anndata,
-    scrna_raw_counts_properties,
-)
+from .._utils import _get_batch_code_from_category, scrna_raw_counts_properties
 from ._utils import _de_core
 
 logger = logging.getLogger(__name__)
-
-Number = Union[int, float]
 
 
 class RNASeqMixin:
@@ -102,12 +97,14 @@ class RNASeqMixin:
             adata=adata, indices=indices, batch_size=batch_size
         )
 
-        transform_batch = _get_batch_code_from_category(adata, transform_batch)
+        transform_batch = _get_batch_code_from_category(
+            self.get_anndata_manager(adata, required=True), transform_batch
+        )
 
         if gene_list is None:
             gene_mask = slice(None)
         else:
-            all_genes = _get_var_names_from_setup_anndata(adata)
+            all_genes = adata.var_names
             gene_mask = [True if gene in gene_list else False for gene in all_genes]
 
         if n_samples > 1 and return_mean is False:
@@ -117,10 +114,10 @@ class RNASeqMixin:
                 )
             return_numpy = True
         if library_size == "latent":
-            generative_output_key = "px_rate"
+            generative_output_key = "mu"
             scaling = 1
         else:
-            generative_output_key = "px_scale"
+            generative_output_key = "scale"
             scaling = library_size
 
         exprs = []
@@ -135,7 +132,7 @@ class RNASeqMixin:
                     generative_kwargs=generative_kwargs,
                     compute_loss=False,
                 )
-                output = generative_outputs[generative_output_key]
+                output = getattr(generative_outputs["px"], generative_output_key)
                 output = output[..., gene_mask]
                 output *= scaling
                 output = output.cpu().numpy()
@@ -193,7 +190,7 @@ class RNASeqMixin:
         ----------
         {doc_differential_expression}
         **kwargs
-            Keyword args for :func:`scvi.utils.DifferentialComputation.get_bayes_factors`
+            Keyword args for :meth:`scvi.model.base.DifferentialComputation.get_bayes_factors`
 
         Returns
         -------
@@ -201,7 +198,7 @@ class RNASeqMixin:
         """
         adata = self._validate_anndata(adata)
 
-        col_names = _get_var_names_from_setup_anndata(adata)
+        col_names = adata.var_names
         model_fn = partial(
             self.get_normalized_expression,
             return_numpy=True,
@@ -209,7 +206,7 @@ class RNASeqMixin:
             batch_size=batch_size,
         )
         result = _de_core(
-            adata,
+            self.get_anndata_manager(adata, required=True),
             model_fn,
             groupby,
             group1,
@@ -278,7 +275,7 @@ class RNASeqMixin:
         if gene_list is None:
             gene_mask = slice(None)
         else:
-            all_genes = _get_var_names_from_setup_anndata(adata)
+            all_genes = adata.var_names
             gene_mask = [True if gene in gene_list else False for gene in all_genes]
 
         x_new = []
@@ -332,7 +329,7 @@ class RNASeqMixin:
 
         data_loader_list = []
         for tensors in scdl:
-            x = tensors[_CONSTANTS.X_KEY]
+            x = tensors[REGISTRY_KEYS.X_KEY]
             generative_kwargs = self._get_transform_batch_gen_kwargs(transform_batch)
             inference_kwargs = dict(n_samples=n_samples)
             _, generative_outputs = self.module.forward(
@@ -341,8 +338,12 @@ class RNASeqMixin:
                 generative_kwargs=generative_kwargs,
                 compute_loss=False,
             )
-            px_scale = generative_outputs["px_scale"]
-            px_r = generative_outputs["px_r"]
+            if "px" in generative_outputs:
+                px_scale = generative_outputs["px"].scale
+                px_r = generative_outputs["px"].theta
+            else:
+                px_scale = generative_outputs["px_scale"]
+                px_r = generative_outputs["px_r"]
             device = px_r.device
 
             rate = rna_size_factor * px_scale
@@ -411,7 +412,9 @@ class RNASeqMixin:
 
         adata = self._validate_anndata(adata)
 
-        transform_batch = _get_batch_code_from_category(adata, transform_batch)
+        transform_batch = _get_batch_code_from_category(
+            self.get_anndata_manager(adata, required=True), transform_batch
+        )
 
         corr_mats = []
         for b in transform_batch:
@@ -440,7 +443,7 @@ class RNASeqMixin:
                 )
             corr_mats.append(corr_matrix)
         corr_matrix = np.mean(np.stack(corr_mats), axis=0)
-        var_names = _get_var_names_from_setup_anndata(adata)
+        var_names = adata.var_names
         return pd.DataFrame(corr_matrix, index=var_names, columns=var_names)
 
     @torch.no_grad()
@@ -484,9 +487,10 @@ class RNASeqMixin:
                 inference_kwargs=inference_kwargs,
                 compute_loss=False,
             )
-            px_r = generative_outputs["px_r"]
-            px_rate = generative_outputs["px_rate"]
-            px_dropout = generative_outputs["px_dropout"]
+            px = generative_outputs["px"]
+            px_r = px.theta
+            px_rate = px.mu
+            px_dropout = px.zi_probs
 
             n_batch = px_rate.size(0) if n_samples == 1 else px_rate.size(1)
 
@@ -498,9 +502,9 @@ class RNASeqMixin:
             mean_list += [px_rate.cpu().numpy()]
             dropout_list += [px_dropout.cpu().numpy()]
 
-        dropout = np.concatenate(dropout_list)
-        means = np.concatenate(mean_list)
-        dispersions = np.concatenate(dispersion_list)
+        dropout = np.concatenate(dropout_list, axis=-2)
+        means = np.concatenate(mean_list, axis=-2)
+        dispersions = np.concatenate(dispersion_list, axis=-2)
         if give_mean and n_samples > 1:
             dropout = dropout.mean(0)
             means = means.mean(0)
@@ -541,8 +545,8 @@ class RNASeqMixin:
         batch_size
             Minibatch size for data loading into model. Defaults to `scvi.settings.batch_size`.
         """
-        if not self.is_trained_:
-            raise RuntimeError("Please train the model first.")
+        self._check_if_trained(warn=False)
+
         adata = self._validate_anndata(adata)
         scdl = self._make_data_loader(
             adata=adata, indices=indices, batch_size=batch_size
@@ -556,13 +560,13 @@ class RNASeqMixin:
             if not give_mean:
                 library = torch.exp(library)
             else:
-                ql_m = outputs["ql_m"]
-                ql_v = outputs["ql_v"]
-                if ql_m is None or ql_v is None:
+                ql = outputs["ql"]
+                if ql is None:
+
                     raise RuntimeError(
                         "The module for this model does not compute the posterior distribution "
                         "for the library size. Set `give_mean` to False to use the observed library size instead."
                     )
-                library = torch.distributions.LogNormal(ql_m, ql_v.sqrt()).mean
+                library = torch.distributions.LogNormal(ql.loc, ql.scale).mean
             libraries += [library.cpu()]
         return torch.cat(libraries).numpy()

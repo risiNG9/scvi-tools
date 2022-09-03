@@ -5,13 +5,16 @@ import numpy as np
 import torch
 from anndata import AnnData
 from torch import logsumexp
-from torch.distributions import Beta, Normal
+from torch.distributions import Beta
 
-from scvi import _CONSTANTS
+from scvi import REGISTRY_KEYS
 from scvi._compat import Literal
+from scvi.data import AnnDataManager
+from scvi.data.fields import CategoricalObsField, LayerField
 from scvi.model._utils import _init_library_size
 from scvi.model.base import UnsupervisedTrainingMixin
 from scvi.module import AutoZIVAE
+from scvi.utils import setup_anndata_dsp
 
 from .base import BaseModelClass, VAEMixin
 
@@ -27,7 +30,7 @@ class AUTOZI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
     Parameters
     ----------
     adata
-        AnnData object that has been registered via :func:`~scvi.data.setup_anndata`.
+        AnnData object that has been registered via :meth:`~scvi.model.AUTOZI.setup_anndata`.
     n_hidden
         Number of nodes per hidden layer
     n_latent
@@ -77,15 +80,15 @@ class AUTOZI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
     --------
 
     >>> adata = anndata.read_h5ad(path_to_anndata)
-    >>> scvi.data.setup_anndata(adata, batch_key="batch")
-    >>> vae = scvi.model.AutoZIVAE(adata)
+    >>> scvi.model.AUTOZI.setup_anndata(adata, batch_key="batch")
+    >>> vae = scvi.model.AUTOZI(adata)
     >>> vae.train(n_epochs=400)
 
     Notes
     -----
     See further usage examples in the following tutorials:
 
-    1. :doc:`/user_guide/notebooks/AutoZI_tutorial`
+    1. :doc:`/tutorials/notebooks/AutoZI_tutorial`
     """
 
     def __init__(
@@ -107,13 +110,15 @@ class AUTOZI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         super(AUTOZI, self).__init__(adata)
 
         self.use_observed_lib_size = use_observed_lib_size
-        n_batch = self.summary_stats["n_batch"]
-        library_log_means, library_log_vars = _init_library_size(adata, n_batch)
+        n_batch = self.summary_stats.n_batch
+        library_log_means, library_log_vars = _init_library_size(
+            self.adata_manager, n_batch
+        )
 
         self.module = AutoZIVAE(
-            n_input=self.summary_stats["n_vars"],
+            n_input=self.summary_stats.n_vars,
             n_batch=n_batch,
-            n_labels=self.summary_stats["n_labels"],
+            n_labels=self.summary_stats.n_labels,
             n_hidden=n_hidden,
             n_latent=n_latent,
             n_layers=n_layers,
@@ -200,20 +205,19 @@ class AUTOZI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                 alpha_posterior, beta_posterior
             )
             for tensors in scdl:
-                sample_batch = tensors[_CONSTANTS.X_KEY].to(self.device)
-                batch_index = tensors[_CONSTANTS.BATCH_KEY].to(self.device)
-                labels = tensors[_CONSTANTS.LABELS_KEY].to(self.device)
+                sample_batch = tensors[REGISTRY_KEYS.X_KEY].to(self.device)
+                batch_index = tensors[REGISTRY_KEYS.BATCH_KEY].to(self.device)
+                labels = tensors[REGISTRY_KEYS.LABELS_KEY].to(self.device)
 
                 # Distribution parameters and sampled variables
                 inf_outputs, gen_outputs, _ = self.module.forward(tensors)
 
-                px_r = gen_outputs["px_r"]
-                px_rate = gen_outputs["px_rate"]
-                px_dropout = gen_outputs["px_dropout"]
-                qz_m = inf_outputs["qz_m"]
-                qz_v = inf_outputs["qz_v"]
+                px = gen_outputs["px"]
+                px_r = px.theta
+                px_rate = px.mu
+                px_dropout = px.zi_logits
+                qz = inf_outputs["qz"]
                 z = inf_outputs["z"]
-                library = inf_outputs["library"]
 
                 # Reconstruction Loss
                 bernoulli_params_batch = self.module.reshape_bernoulli(
@@ -230,36 +234,22 @@ class AUTOZI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                 )
 
                 # Log-probabilities
-                log_prob_sum = torch.zeros(qz_m.shape[0]).to(self.device)
-                p_z = (
-                    Normal(torch.zeros_like(qz_m), torch.ones_like(qz_v))
-                    .log_prob(z)
-                    .sum(dim=-1)
-                )
+                p_z = gen_outputs["pz"].log_prob(z).sum(dim=-1)
                 p_x_zld = -reconst_loss
-                log_prob_sum += p_z + p_x_zld
-
-                q_z_x = Normal(qz_m, qz_v.sqrt()).log_prob(z).sum(dim=-1)
-                log_prob_sum -= q_z_x
+                q_z_x = qz.log_prob(z).sum(dim=-1)
+                log_prob_sum = p_z + p_x_zld - q_z_x
 
                 if not self.use_observed_lib_size:
+                    ql = inf_outputs["ql"]
+                    library = inf_outputs["library"]
                     (
                         local_library_log_means,
                         local_library_log_vars,
                     ) = self.module._compute_local_library_params(batch_index)
 
-                    p_l = (
-                        Normal(
-                            local_library_log_means.to(self.device),
-                            local_library_log_vars.to(self.device).sqrt(),
-                        )
-                        .log_prob(library)
-                        .sum(dim=-1)
-                    )
+                    p_l = gen_outputs["pl"].log_prob(library).sum(dim=-1)
 
-                    ql_m = inf_outputs["ql_m"]
-                    ql_v = inf_outputs["ql_v"]
-                    q_l_x = Normal(ql_m, ql_v.sqrt()).log_prob(library).sum(dim=-1)
+                    q_l_x = ql.log_prob(library).sum(dim=-1)
 
                     log_prob_sum += p_l - q_l_x
 
@@ -274,3 +264,34 @@ class AUTOZI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         log_lkl = logsumexp(to_sum, dim=-1).item() - np.log(n_mc_samples)
         n_samples = len(scdl.indices)
         return log_lkl / n_samples
+
+    @classmethod
+    @setup_anndata_dsp.dedent
+    def setup_anndata(
+        cls,
+        adata: AnnData,
+        batch_key: Optional[str] = None,
+        labels_key: Optional[str] = None,
+        layer: Optional[str] = None,
+        **kwargs,
+    ):
+        """
+        %(summary)s.
+
+        Parameters
+        ----------
+        %(param_batch_key)s
+        %(param_labels_key)s
+        %(param_layer)s
+        """
+        setup_method_args = cls._get_setup_method_args(**locals())
+        anndata_fields = [
+            LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
+            CategoricalObsField(REGISTRY_KEYS.BATCH_KEY, batch_key),
+            CategoricalObsField(REGISTRY_KEYS.LABELS_KEY, labels_key),
+        ]
+        adata_manager = AnnDataManager(
+            fields=anndata_fields, setup_method_args=setup_method_args
+        )
+        adata_manager.register_fields(adata, **kwargs)
+        cls.register_manager(adata_manager)
