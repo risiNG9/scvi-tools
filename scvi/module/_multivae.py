@@ -266,6 +266,7 @@ class MULTIVAE(BaseModuleClass):
         protein_background_prior_mean: Optional[np.ndarray] = None,
         protein_background_prior_scale: Optional[np.ndarray] = None,
         protein_dispersion: str = "protein",
+        use_size_factor_key: bool = False,
     ):
         super().__init__()
 
@@ -504,14 +505,14 @@ class MULTIVAE(BaseModuleClass):
             self.mod_weights = torch.nn.Parameter(torch.ones(n_obs, self.n_modalities))
 
     def _get_inference_input(self, tensors):
-        x = tensors[_CONSTANTS.X_KEY]
+        x = tensors[REGISTRY_KEYS.X_KEY]
         if self.n_input_proteins == 0:
             y = torch.zeros(x.shape[0], 1, device=x.device, requires_grad=False)
         else:
-            y = tensors[_CONSTANTS.PROTEIN_EXP_KEY]
-        batch_index = tensors[_CONSTANTS.BATCH_KEY]
-        cont_covs = tensors.get(_CONSTANTS.CONT_COVS_KEY)
-        cat_covs = tensors.get(_CONSTANTS.CAT_COVS_KEY)
+            y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
+        batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
+        cont_covs = tensors.get(REGISTRY_KEYS.CONT_COVS_KEY)
+        cat_covs = tensors.get(REGISTRY_KEYS.CAT_COVS_KEY)
         input_dict = dict(
             x=x,
             y=y,
@@ -562,10 +563,10 @@ class MULTIVAE(BaseModuleClass):
             categorical_input = tuple()
 
         # Z Encoders
-        qz_acc, z_acc = self.z_encoder_accessibility(
+        qzm_acc, qzv_acc, z_acc = self.z_encoder_accessibility(
             encoder_input_accessibility, batch_index, *categorical_input
         )
-        qz_expr, z_expr = self.z_encoder_expression(
+        qzm_expr, qzv_expr, z_expr = self.z_encoder_expression(
             encoder_input_expression, batch_index, *categorical_input
         )
         qzm_pro, qzv_pro, z_pro = self.z_encoder_protein(
@@ -586,7 +587,7 @@ class MULTIVAE(BaseModuleClass):
             weights = self.mod_weights.unsqueeze(0).expand(len(cell_idx), -1)
 
         ## mix representation
-        qz_m = self._mix_modalities((qzm_expr, qzm_acc), (mask_expr, mask_acc), weights)
+        qz_m = self._mix_modalities((qzm_expr, qzm_acc, qzm_pro), (mask_expr, mask_acc, mask_pro), weights)
         qz_v = self._mix_modalities(
             (qzv_expr, qzv_acc),
             (mask_expr, mask_acc),
@@ -596,9 +597,9 @@ class MULTIVAE(BaseModuleClass):
 
         # ReFormat Outputs
         if n_samples > 1:
-            untran_za = qz_acc.sample((n_samples,))
+            untran_za = qzm_acc.sample((n_samples,))
             z_acc = self.z_encoder_accessibility.z_transformation(untran_za)
-            untran_zr = qz_expr.sample((n_samples,))
+            untran_zr = qzm_expr.sample((n_samples,))
             z_expr = self.z_encoder_expression.z_transformation(untran_zr)
 
             qzm_pro = qzm_pro.unsqueeze(0).expand(
@@ -753,7 +754,7 @@ class MULTIVAE(BaseModuleClass):
         else:
             raise ValueError("modality penalty not supported")
         return torch.where(
-            torch.logical_and(mask1, mask2),
+            torch.logical_and(torch.logical_and(mask1, mask2), mask3),
             pair_penalty.T,
             torch.zeros_like(pair_penalty).T,
         ).sum(dim=0)
@@ -850,7 +851,7 @@ class MULTIVAE(BaseModuleClass):
         self, tensors, inference_outputs, generative_outputs, kl_weight: float = 1.0
     ):
         # Get the data
-        x = tensors[_CONSTANTS.X_KEY]
+        x = tensors[REGISTRY_KEYS.X_KEY]
         if self.n_input_genes == 0:
             x_rna = torch.zeros(x.shape[0], 1, device=x.device, requires_grad=False)
         else:
@@ -862,8 +863,8 @@ class MULTIVAE(BaseModuleClass):
         if self.n_input_proteins == 0:
             y = torch.zeros(x.shape[0], 1, device=x.device, requires_grad=False)
         else:
-            y = tensors[_CONSTANTS.PROTEIN_EXP_KEY]
-        batch_index = tensors[_CONSTANTS.BATCH_KEY]
+            y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
+        batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
 
         mask_expr = x_rna.sum(dim=1) > 0
         mask_acc = x_chr.sum(dim=1) > 0

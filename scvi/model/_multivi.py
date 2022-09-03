@@ -1,6 +1,6 @@
 import logging
 from functools import partial
-from typing import Dict, Iterable, Optional, Sequence, Tuple, TypeVar, Union
+from typing import Dict, Iterable, Optional, Sequence, Tuple, TypeVar, Union, List
 
 import warnings
 from collections.abc import Iterable as IterableClass
@@ -29,6 +29,7 @@ from scvi.model._utils import (
     _get_batch_code_from_category,
     scatac_raw_counts_properties,
     scrna_raw_counts_properties,
+    _get_var_names_from_manager,
 )
 from scvi.model.base import UnsupervisedTrainingMixin
 from scvi.module import MULTIVAE
@@ -145,14 +146,19 @@ class MULTIVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             else []
         )
 
-        if "totalvi_batch_mask" in self.scvi_setup_dict_.keys():
-            batch_mask = self.scvi_setup_dict_["totalvi_batch_mask"]
-        else:
-            batch_mask = None
+        # if "totalvi_batch_mask" in self.scvi_setup_dict_.keys():
+        #     batch_mask = self.scvi_setup_dict_["totalvi_batch_mask"]
+        # else:
+        #     batch_mask = None
+        batch_mask=None
         if empirical_protein_background_prior:
             prior_mean, prior_scale = None, None
         else:
             prior_mean, prior_scale = None, None
+        
+        use_size_factor_key = (
+            REGISTRY_KEYS.SIZE_FACTOR_KEY in self.adata_manager.data_registry
+        )
 
         self.module = MULTIVAE(
             n_obs=adata.n_obs,
@@ -461,6 +467,7 @@ class MULTIVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         normalize_cells: bool = False,
         normalize_regions: bool = False,
         batch_size: int = 128,
+        return_numpy: bool = False,
     ) -> Union[np.ndarray, csr_matrix]:
 
         if self.n_regions == 0:
@@ -730,7 +737,7 @@ class MULTIVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         if gene_list is None:
             gene_mask = slice(None)
         else:
-            all_genes = _get_var_names_from_setup_anndata(adata)
+            all_genes = _get_var_names_from_manager(adata)
             gene_mask = [gene in gene_list for gene in all_genes]
 
         exprs = []
@@ -738,8 +745,8 @@ class MULTIVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             per_batch_exprs = []
             for batch in transform_batch:
                 if batch is not None:
-                    batch_indices = tensors[_CONSTANTS.BATCH_KEY]
-                    tensors[_CONSTANTS.BATCH_KEY] = (
+                    batch_indices = tensors[REGISTRY_KEYS.BATCH_KEY]
+                    tensors[REGISTRY_KEYS.BATCH_KEY] = (
                         torch.ones_like(batch_indices) * batch
                     )
                 _, generative_outputs = self.module.forward(
@@ -848,7 +855,7 @@ class MULTIVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
 
         transform_batch = _get_batch_code_from_category(adata, transform_batch)
         for tensors in post:
-            y = tensors[_CONSTANTS.PROTEIN_EXP_KEY]
+            y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
             py_mixing = torch.zeros_like(y[..., protein_mask])
             if n_samples > 1:
                 py_mixing = torch.stack(n_samples * [py_mixing])
