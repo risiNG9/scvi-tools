@@ -18,6 +18,7 @@ from scvi.module._peakvae import Decoder as DecoderPeakVI
 from scvi.module.base import BaseModuleClass, LossRecorder, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder, FCLayers, one_hot
 
+from ._utils import masked_softmax
 
 class LibrarySizeEncoder(torch.nn.Module):
     def __init__(
@@ -239,11 +240,14 @@ class MULTIVAE(BaseModuleClass):
 
     def __init__(
         self,
+        n_obs: int = 0,
         n_input_regions: int = 0,
         n_input_genes: int = 0,
         n_input_proteins: int = 0,
         n_batch: int = 0,
         n_labels: int = 0,
+        modality_weights: Literal["equal", "cell", "universal"] = "equal",
+        modality_penalty: Literal["Jeffreys", "MMD", "None"] = "Jeffreys",
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
         n_hidden: Optional[int] = None,
         n_latent: Optional[int] = None,
@@ -267,6 +271,7 @@ class MULTIVAE(BaseModuleClass):
 
         # ####################################################################
         # INIT PARAMS
+        self.n_obs = n_obs
         self.n_input_regions = n_input_regions
         self.n_input_genes = n_input_genes
         self.n_input_proteins = n_input_proteins
@@ -277,6 +282,9 @@ class MULTIVAE(BaseModuleClass):
         )
         self.n_batch = n_batch
         self.n_labels = n_labels
+
+        self.modality_weights = modality_weights
+        self.modality_penalty = modality_penalty
 
         self.latent_distribution = latent_distribution
 
@@ -483,6 +491,16 @@ class MULTIVAE(BaseModuleClass):
             pass
         # ####################################################################
 
+        ## modality alignment
+        self.n_modalities = int(n_input_genes > 0) + int(n_input_regions > 0)
+        if modality_weights == "equal":
+            mod_weights = torch.ones(self.n_modalities)
+            self.register_buffer("mod_weights", mod_weights)
+        elif modality_weights == "universal":
+            self.mod_weights = torch.nn.Parameter(torch.ones(self.n_modalities))
+        else:  # cell-specific weights
+            self.mod_weights = torch.nn.Parameter(torch.ones(n_obs, self.n_modalities))
+
     def _get_inference_input(self, tensors):
         x = tensors[_CONSTANTS.X_KEY]
         if self.n_input_proteins == 0:
@@ -509,6 +527,7 @@ class MULTIVAE(BaseModuleClass):
         batch_index,
         cont_covs,
         cat_covs,
+        cell_idx,
         n_samples=1,
     ) -> Dict[str, torch.Tensor]:
 
@@ -559,6 +578,20 @@ class MULTIVAE(BaseModuleClass):
             encoder_input_accessibility, batch_index, *categorical_input
         )
 
+        if self.modality_weights == "cell":
+            weights = self.mod_weights[cell_idx, :]
+        else:
+            weights = self.mod_weights.unsqueeze(0).expand(len(cell_idx), -1)
+
+        ## mix representation
+        qz_m = self._mix_modalities((qzm_expr, qzm_acc), (mask_expr, mask_acc), weights)
+        qz_v = self._mix_modalities(
+            (qzv_expr, qzv_acc),
+            (mask_expr, mask_acc),
+            weights,
+            torch.sqrt,
+        )
+
         # ReFormat Outputs
         if n_samples > 1:
             qzm_acc = qzm_acc.unsqueeze(0).expand(
@@ -596,51 +629,54 @@ class MULTIVAE(BaseModuleClass):
             )
 
         ## Sample from the average distribution
-        qzp_m123 = (qzm_acc + qzm_expr + qzm_pro) / 3
-        qzp_v123 = (qzv_acc + qzv_expr + qzv_pro) / (3 ** 0.5)
-        zp123 = Normal(qzp_m123, qzp_v123.sqrt()).rsample()
+        # qzp_m123 = (qzm_acc + qzm_expr + qzm_pro) / 3
+        # qzp_v123 = (qzv_acc + qzv_expr + qzv_pro) / (3 ** 0.5)
+        # zp123 = Normal(qzp_m123, qzp_v123.sqrt()).rsample()
 
-        qzp_m12 = (qzm_acc + qzm_expr) / 2
-        qzp_v12 = (qzv_acc + qzv_expr) / (2 ** 0.5)
-        zp12 = Normal(qzp_m12, qzp_v12.sqrt()).rsample()
+        # qzp_m12 = (qzm_acc + qzm_expr) / 2
+        # qzp_v12 = (qzv_acc + qzv_expr) / (2 ** 0.5)
+        # zp12 = Normal(qzp_m12, qzp_v12.sqrt()).rsample()
 
-        qzp_m13 = (qzm_acc + qzm_pro) / 2
-        qzp_v13 = (qzv_acc + qzv_pro) / (2 ** 0.5)
-        zp13 = Normal(qzp_m13, qzp_v13.sqrt()).rsample()
+        # qzp_m13 = (qzm_acc + qzm_pro) / 2
+        # qzp_v13 = (qzv_acc + qzv_pro) / (2 ** 0.5)
+        # zp13 = Normal(qzp_m13, qzp_v13.sqrt()).rsample()
 
-        qzp_m23 = (qzm_expr + qzm_pro) / 2
-        qzp_v23 = (qzv_expr + qzv_pro) / (2 ** 0.5)
-        zp23 = Normal(qzp_m23, qzp_v23.sqrt()).rsample()
+        # qzp_m23 = (qzm_expr + qzm_pro) / 2
+        # qzp_v23 = (qzv_expr + qzv_pro) / (2 ** 0.5)
+        # zp23 = Normal(qzp_m23, qzp_v23.sqrt()).rsample()
 
-        ## choose the correct latent representation based on the modality
-        qz_m = self._mix_modalities123(
-            qzp_m123,
-            qzp_m12,
-            qzp_m13,
-            qzp_m23,
-            qzm_expr,
-            qzm_acc,
-            qzm_pro,
-            mask_expr,
-            mask_acc,
-            mask_pro,
-        )
+        # ## choose the correct latent representation based on the modality
+        # qz_m = self._mix_modalities123(
+        #     qzp_m123,
+        #     qzp_m12,
+        #     qzp_m13,
+        #     qzp_m23,
+        #     qzm_expr,
+        #     qzm_acc,
+        #     qzm_pro,
+        #     mask_expr,
+        #     mask_acc,
+        #     mask_pro,
+        # )
 
-        qz_v = self._mix_modalities123(
-            qzp_v123,
-            qzp_v12,
-            qzp_v13,
-            qzp_v23,
-            qzv_expr,
-            qzv_acc,
-            qzv_pro,
-            mask_expr,
-            mask_acc,
-            mask_pro,
-        )
-        z = self._mix_modalities123(
-            zp123, zp12, zp13, zp23, z_expr, z_acc, z_pro, mask_expr, mask_acc, mask_pro
-        )
+        # qz_v = self._mix_modalities123(
+        #     qzp_v123,
+        #     qzp_v12,
+        #     qzp_v13,
+        #     qzp_v23,
+        #     qzv_expr,
+        #     qzv_acc,
+        #     qzv_pro,
+        #     mask_expr,
+        #     mask_acc,
+        #     mask_pro,
+        # )
+        # z = self._mix_modalities123(
+        #     zp123, zp12, zp13, zp23, z_expr, z_acc, z_pro, mask_expr, mask_acc, mask_pro
+        # )
+
+        untran_z = Normal(qz_m, qz_v.sqrt()).rsample()
+        z = self.z_encoder_accessibility.z_transformation(untran_z)
 
         if self.n_batch > 0:
             py_back_alpha_prior = F.linear(
@@ -672,6 +708,66 @@ class MULTIVAE(BaseModuleClass):
             libsize_acc=libsize_acc,
         )
         return outputs
+    
+    @auto_move_data
+    def _mix_modalities(self, Xs, masks, weights, weight_transform: callable = None):
+        """Compute the weighted mean of the Xs while masking values that originate
+        from modalities that aren't measured.
+
+        Parameters
+        ----------
+        Xs
+            Sequence of Xs to mix, each should be (N x D)
+        masks
+            Sequence of masks corresponding to the Xs, indicating whether the values
+            should be included in the mix or not (N)
+        weights
+            Weights for each modality (either K or N x K)
+        weight_transform
+            Transformation to apply to the weights before using them
+        """
+        # (batch_size x latent) -> (batch_size x modalities x latent)
+        Xs = torch.stack(Xs, dim=1)
+        # (batch_size) -> (batch_size x modalities)
+        masks = torch.stack(masks, dim=1).float()
+        weights = masked_softmax(weights, masks, dim=-1)
+
+        # (batch_size x modalities) -> (batch_size x modalities x latent)
+        weights = weights.unsqueeze(-1)
+        if weight_transform is not None:
+            weights = weight_transform(weights)
+
+        # sum over modalities, so output is (batch_size x latent)
+        return (weights * Xs).sum(1)
+
+    def _compute_mod_penalty(self, mod_params1, mod_params2, mod_params3, mask1, mask2, mask3):
+        """Compute the weighted mean of the Xs while masking values that originate
+        from modalities that aren't measured.
+
+        Parameters
+        ----------
+        mod_params1/2
+            Posterior parameters for for modality 1/2
+        mask1/2
+            mask for modality 1/2
+        """
+        if self.modality_penalty == "None":
+            return 0
+        elif self.modality_penalty == "Jeffreys":
+            rv1 = Normal(mod_params1[0], mod_params1[1].sqrt())
+            rv2 = Normal(mod_params2[0], mod_params2[1].sqrt())
+            rv3 = Normal(mod_params3[0], mod_params3[1].sqrt())
+            pair_penalty = kld(rv1, rv2) + kld(rv2, rv1) + kld(rv1, rv3) + kld(rv3, rv1) + kld(rv2, rv3) + kld(rv3, rv2)
+        elif self.modality_penalty == "MMD":
+            raise ValueError("MMD not supported yet")
+            pair_penalty = torch.linalg.norm(mod_params1[0] - mod_params2[0], dim=1)
+        else:
+            raise ValueError("modality penalty not supported")
+        return torch.where(
+            torch.logical_and(mask1, mask2),
+            pair_penalty.T,
+            torch.zeros_like(pair_penalty).T,
+        ).sum(dim=0)
 
     def _get_generative_input(self, tensors, inference_outputs, transform_batch=None):
         z = inference_outputs["z"]
@@ -820,55 +916,21 @@ class MULTIVAE(BaseModuleClass):
             )
 
         # mix losses to get the correct loss for each cell
-        recon_loss = self._mix_modalities123(
-            rl_accessibility + rl_expression + rl_protein,
-            rl_expression + rl_accessibility,
-            rl_expression + rl_protein,
-            rl_accessibility + rl_protein,
-            rl_expression,
-            rl_accessibility,
-            rl_protein,
-            mask_expr,
-            mask_acc,
-            mask_pro,
-        )
+        recon_loss = (rl_expression * mask_expr) + (rl_accessibility * mask_acc) + (rl_protein * mask_pro)
 
         # Compute KLD between Z and N(0,I)
         qz_m = inference_outputs["qz_m"]
         qz_v = inference_outputs["qz_v"]
         kl_div_z = kld(Normal(qz_m, torch.sqrt(qz_v)), Normal(0, 1)).sum(dim=1)
 
-        # Compute KLD between distributions for paired data
-        qzm_expr = inference_outputs["qzm_expr"]
-        qzv_expr = inference_outputs["qzv_expr"]
-        qzm_acc = inference_outputs["qzm_acc"]
-        qzv_acc = inference_outputs["qzv_acc"]
-        qzm_pro = inference_outputs["qzm_pro"]
-        qzv_pro = inference_outputs["qzv_pro"]
-
-        def symKLd(qzm1, qzv1, qzm2, qzv2):
-            out = kld(
-                Normal(qzm1, torch.sqrt(qzv1)), Normal(qzm2, torch.sqrt(qzv2))
-            ) + kld(Normal(qzm2, torch.sqrt(qzv2)), Normal(qzm1, torch.sqrt(qzv1)))
-
-            return out
-
-        symKLd12 = symKLd(qzm_expr, qzv_expr, qzm_acc, qzv_acc)
-        symKLd13 = symKLd(qzm_expr, qzv_expr, qzm_pro, qzv_pro)
-        symKLd23 = symKLd(qzm_acc, qzv_acc, qzm_pro, qzv_pro)
-
-        kld_paired = self._mix_modalities123(
-            symKLd12 + symKLd13 + symKLd23,
-            symKLd12,
-            symKLd13,
-            symKLd23,
-            torch.zeros(x.shape[0], device=x.device, requires_grad=False),
-            torch.zeros(x.shape[0], device=x.device, requires_grad=False),
-            torch.zeros(x.shape[0], device=x.device, requires_grad=False),
+        kld_paired = self._compute_mod_penalty(
+            (inference_outputs["qzm_expr"], inference_outputs["qzv_expr"]),
+            (inference_outputs["qzm_acc"], inference_outputs["qzv_acc"]),
+            (inference_outputs["qzm_pro"], inference_outputs["qzv_pro"]),
             mask_expr,
             mask_acc,
             mask_pro,
-        ).sum(dim=1)
+        )
 
         # KL WARMUP
         kl_local_for_warmup = kl_div_z

@@ -107,6 +107,8 @@ class MULTIVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         n_genes: int,
         n_regions: int,
         n_proteins: int,
+        modality_weights: Literal["equal", "cell", "universal"] = "equal",
+        modality_penalty: Literal["Jeffreys", "MMD", "None"] = "Jeffreys",
         n_hidden: Optional[int] = None,
         n_latent: Optional[int] = None,
         n_layers_encoder: int = 2,
@@ -144,10 +146,13 @@ class MULTIVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             prior_mean, prior_scale = None, None
 
         self.module = MULTIVAE(
+            n_obs=adata.n_obs,
             n_input_genes=n_genes,
             n_input_regions=n_regions,
             n_input_proteins=n_proteins,
             n_batch=self.summary_stats["n_batch"],
+            modality_weights=modality_weights,
+            modality_penalty=modality_penalty,
             n_hidden=n_hidden,
             n_latent=n_latent,
             n_layers_encoder=n_layers_encoder,
