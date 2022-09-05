@@ -23,6 +23,7 @@ from scvi.data.fields import (
     LayerField,
     NumericalJointObsField,
     NumericalObsField,
+    ProteinObsmField,
 )
 from scvi.dataloaders import DataSplitter
 from scvi.model._utils import (
@@ -1096,8 +1097,10 @@ class MULTIVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
     def setup_anndata(
         cls,
         adata: AnnData,
+        protein_expression_obsm_key: Optional[str] = None,
         layer: Optional[str] = None,
         batch_key: Optional[str] = None,
+        protein_names_uns_key: Optional[str] = None,
         size_factor_key: Optional[str] = None,
         categorical_covariate_keys: Optional[List[str]] = None,
         continuous_covariate_keys: Optional[List[str]] = None,
@@ -1115,6 +1118,7 @@ class MULTIVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         %(param_cont_cov_keys)s
         """
         setup_method_args = cls._get_setup_method_args(**locals())
+        batch_field = CategoricalObsField(REGISTRY_KEYS.BATCH_KEY, batch_key)
         anndata_fields = [
             LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
             CategoricalObsField(REGISTRY_KEYS.BATCH_KEY, batch_key),
@@ -1126,6 +1130,14 @@ class MULTIVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             ),
             NumericalJointObsField(
                 REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys
+            ),
+            ProteinObsmField(
+                REGISTRY_KEYS.PROTEIN_EXP_KEY,
+                protein_expression_obsm_key,
+                use_batch_mask=True,
+                batch_field=batch_field,
+                colnames_uns_key=protein_names_uns_key,
+                is_count_data=True,
             ),
         ]
         adata_manager = AnnDataManager(
