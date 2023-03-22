@@ -3,6 +3,7 @@ from typing import Callable, Iterable, Literal, Optional
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch import logsumexp
 from torch.distributions import Normal
@@ -37,6 +38,8 @@ class VAE(BaseMinifiedModeModuleClass):
         Dimensionality of the latent space
     n_layers
         Number of hidden layers used for encoder and decoder NNs
+    n_critic_dim
+        Number of dimensions to use for critic embedding
     n_continuous_cov
         Number of continuous covarites
     n_cats_per_cov
@@ -86,6 +89,8 @@ class VAE(BaseMinifiedModeModuleClass):
     var_activation
         Callable used to ensure positivity of the variational distributions' variance.
         When `None`, defaults to `torch.exp`.
+    critic_loss_factor
+        Factor to scale critic loss by. This is used to balance the critic loss with the ELBO
     """
 
     def __init__(
@@ -96,6 +101,7 @@ class VAE(BaseMinifiedModeModuleClass):
         n_hidden: Tunable[int] = 128,
         n_latent: Tunable[int] = 10,
         n_layers: Tunable[int] = 1,
+        n_critic_dim: Tunable[int] = 64,
         n_continuous_cov: int = 0,
         n_cats_per_cov: Optional[Iterable[int]] = None,
         dropout_rate: Tunable[float] = 0.1,
@@ -114,6 +120,7 @@ class VAE(BaseMinifiedModeModuleClass):
         library_log_means: Optional[np.ndarray] = None,
         library_log_vars: Optional[np.ndarray] = None,
         var_activation: Optional[Callable] = None,
+        critic_loss_factor: Tunable[float] = 1e-3,
     ):
         super().__init__()
         self.dispersion = dispersion
@@ -180,6 +187,13 @@ class VAE(BaseMinifiedModeModuleClass):
             use_layer_norm=use_layer_norm_encoder,
             var_activation=var_activation,
             return_dist=True,
+            return_hidden=True,
+        )
+        self.x_critic = nn.Sequential(
+            nn.Linear(n_hidden, n_hidden), nn.ReLU(), nn.Linear(n_hidden, n_critic_dim)
+        )
+        self.z_critic = nn.Sequential(
+            nn.Linear(n_latent, n_hidden), nn.ReLU(), nn.Linear(n_hidden, n_critic_dim)
         )
         # l encoder goes from n_input-dimensional data to 1-d library size
         self.l_encoder = Encoder(
@@ -314,7 +328,9 @@ class VAE(BaseMinifiedModeModuleClass):
             categorical_input = torch.split(cat_covs, 1, dim=1)
         else:
             categorical_input = ()
-        qz, z = self.z_encoder(encoder_input, batch_index, *categorical_input)
+        qz, z, h = self.z_encoder(encoder_input, batch_index, *categorical_input)
+        x_critic_embed = self.x_critic_encoder(h)
+        z_critic_embed = self.z_critic_encoder(z)
         ql = None
         if not self.use_observed_lib_size:
             ql, library_encoded = self.l_encoder(
@@ -331,7 +347,14 @@ class VAE(BaseMinifiedModeModuleClass):
                 )
             else:
                 library = ql.sample((n_samples,))
-        outputs = {"z": z, "qz": qz, "ql": ql, "library": library}
+        outputs = {
+            "z": z,
+            "qz": qz,
+            "ql": ql,
+            "library": library,
+            "x_critic_embed": x_critic_embed,
+            "z_critic_embed": z_critic_embed,
+        }
         return outputs
 
     @auto_move_data
@@ -443,6 +466,16 @@ class VAE(BaseMinifiedModeModuleClass):
         kl_weight: float = 1.0,
     ):
         """Computes the loss function for the model."""
+        # critic loss
+        x_critic_embed = inference_outputs["x_critic_embed"]
+        z_critic_embed = inference_outputs["z_critic_embed"]
+        critic_inner_product = torch.matmul(x_critic_embed, z_critic_embed.T)
+        critic_loss = (
+            -torch.diag(critic_inner_product).sum() + critic_inner_product.sum()
+        )
+        critic_loss /= z_critic_embed.size(0)
+
+        # elbo loss
         x = tensors[REGISTRY_KEYS.X_KEY]
         kl_divergence_z = kl(inference_outputs["qz"], generative_outputs["pz"]).sum(
             dim=1
@@ -462,7 +495,7 @@ class VAE(BaseMinifiedModeModuleClass):
 
         weighted_kl_local = kl_weight * kl_local_for_warmup + kl_local_no_warmup
 
-        loss = torch.mean(reconst_loss + weighted_kl_local)
+        loss = torch.mean(reconst_loss + weighted_kl_local) + critic_loss
 
         kl_local = {
             "kl_divergence_l": kl_divergence_l,

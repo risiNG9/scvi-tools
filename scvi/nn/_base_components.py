@@ -237,6 +237,7 @@ class Encoder(nn.Module):
         var_eps: float = 1e-4,
         var_activation: Optional[Callable] = None,
         return_dist: bool = False,
+        return_hidden: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -255,6 +256,7 @@ class Encoder(nn.Module):
         self.mean_encoder = nn.Linear(n_hidden, n_output)
         self.var_encoder = nn.Linear(n_hidden, n_output)
         self.return_dist = return_dist
+        self.return_hidden = return_hidden
 
         if distribution == "ln":
             self.z_transformation = nn.Softmax(dim=-1)
@@ -289,8 +291,13 @@ class Encoder(nn.Module):
         dist = Normal(q_m, q_v.sqrt())
         latent = self.z_transformation(dist.rsample())
         if self.return_dist:
-            return dist, latent
-        return q_m, q_v, latent
+            if not self.return_hidden:
+                return dist, latent
+            else:
+                return dist, latent, q
+        if not self.return_hidden:
+            return q_m, q_v, latent
+        return q_m, q_v, latent, q
 
 
 # Decoder
