@@ -132,6 +132,7 @@ class VAE(BaseMinifiedModeModuleClass):
         self.n_labels = n_labels
         self.latent_distribution = latent_distribution
         self.encode_covariates = encode_covariates
+        self.critic_loss_factor = critic_loss_factor
 
         self.use_size_factor_key = use_size_factor_key
         self.use_observed_lib_size = use_size_factor_key or use_observed_lib_size
@@ -329,8 +330,8 @@ class VAE(BaseMinifiedModeModuleClass):
         else:
             categorical_input = ()
         qz, z, h = self.z_encoder(encoder_input, batch_index, *categorical_input)
-        x_critic_embed = self.x_critic_encoder(h)
-        z_critic_embed = self.z_critic_encoder(z)
+        x_critic_embed = self.x_critic(h)
+        z_critic_embed = self.z_critic(z)
         ql = None
         if not self.use_observed_lib_size:
             ql, library_encoded = self.l_encoder(
@@ -469,11 +470,14 @@ class VAE(BaseMinifiedModeModuleClass):
         # critic loss
         x_critic_embed = inference_outputs["x_critic_embed"]
         z_critic_embed = inference_outputs["z_critic_embed"]
+        x_critic_embed = x_critic_embed / x_critic_embed.norm(dim=-1, keepdim=True)
+        z_critic_embed = z_critic_embed / z_critic_embed.norm(dim=-1, keepdim=True)
         critic_inner_product = torch.matmul(x_critic_embed, z_critic_embed.T)
         critic_loss = (
             -torch.diag(critic_inner_product).sum() + critic_inner_product.sum()
         )
         critic_loss /= z_critic_embed.size(0)
+        critic_loss *= self.critic_loss_factor
 
         # elbo loss
         x = tensors[REGISTRY_KEYS.X_KEY]
@@ -502,7 +506,10 @@ class VAE(BaseMinifiedModeModuleClass):
             "kl_divergence_z": kl_divergence_z,
         }
         return LossOutput(
-            loss=loss, reconstruction_loss=reconst_loss, kl_local=kl_local
+            loss=loss,
+            reconstruction_loss=reconst_loss,
+            kl_local=kl_local,
+            extra_metrics={"critic_loss": critic_loss},
         )
 
     @torch.inference_mode()
