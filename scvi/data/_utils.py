@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp_sparse
-from anndata._core.sparse_dataset import SparseDataset
+from anndata._core.sparse_dataset import BaseCompressedSparseDataset as SparseDataset
 from pandas.api.types import CategoricalDtype
 
 from . import _constants

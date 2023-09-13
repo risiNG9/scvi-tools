@@ -4,7 +4,7 @@ from typing import Dict, List, Union
 import h5py
 import numpy as np
 import pandas as pd
-from anndata._core.sparse_dataset import SparseDataset
+from anndata._core.sparse_dataset import BaseCompressedSparseDataset as SparseDataset
 from scipy.sparse import issparse
 from torch.utils.data import Dataset
 
